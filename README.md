@@ -136,7 +136,7 @@ Captures require the shared capture lock and, when an overlay is running, its ac
 
 | Class | Tools | Contract |
 | --- | --- | --- |
-| Read-only observation | `doctor`, `list_apps`, `list_windows`, `focused_window`, `get_app_state` | `readOnlyHint=true`; may reveal app, window, accessibility, and screenshot contents. `get_app_state` may trigger the desktop screenshot portal prompt. |
+| Read-only observation | `doctor`, `policy_status`, `list_apps`, `list_windows`, `focused_window`, `get_app_state` | `readOnlyHint=true`; may reveal app, window, accessibility, and screenshot contents. `get_app_state` may trigger the desktop screenshot portal prompt. |
 | Local setup mutators | `setup_accessibility`, `setup_window_targeting` | `readOnlyHint=false`, `destructiveHint=false`, `idempotentHint=true`; modifies user desktop configuration by enabling accessibility or installing/enabling the GNOME window-targeting extension. |
 | UI state mutators | `activate_window`, `move_window`, `resize_window`, `scroll`, `screenshot` | `readOnlyHint=false`, `destructiveHint=false`; changes focus, geometry, or scroll position in the live desktop, or raises a window to capture it. |
 | Desktop action mutators | `click`, `drag`, `press_key`, `type_text`, `perform_action`, `set_value` | `readOnlyHint=false`, `destructiveHint=true`, `openWorldHint=true`; can trigger arbitrary actions in whatever local application is targeted. |
@@ -158,7 +158,61 @@ computer-use-linux apps
 computer-use-linux state [APP_NAME]
 computer-use-linux screenshot                           # JSON screenshot summary
 computer-use-linux windows
+computer-use-linux stop                                 # kill switch on: mutating tools refuse
+computer-use-linux resume                               # kill switch off
+computer-use-linux policy                               # JSON safety policy status
 ```
+
+### Safety gate (take-my-computer)
+
+The server enforces its own safety gate. Many MCP hosts run with tool approvals off, so annotations are not enough. Every mutating tool passes the gate before it changes focus, shows an indicator event, or sends input. A refused call returns a normal tool result with `ok: false` and a message. `policy_status` reports the current policy.
+
+Set the mode with `TAKE_MY_COMPUTER_POLICY`. An unknown value falls back to `confirm` and prints a warning on stderr.
+
+| Mode | Behavior |
+| --- | --- |
+| `confirm` (default) | Read-only tools run. Low-impact input runs. High-impact actions need confirmation. |
+| `full` | All tools run without confirmation. The audit log and the kill switch still apply. |
+| `observe` | Only read-only tools run. Every mutating tool is refused. |
+
+In `confirm` mode these actions need confirmation:
+
+- `click` or `perform_action` on an element whose name or description has a commit word: send, submit, delete, remove, pay, buy, purchase, checkout, publish, post, transfer, confirm, approve, kirim, hapus, bayar, beli, terbitkan, posting, setujui, konfirmasi. Matching is whole-word and case-insensitive, so "Postman" does not match "post".
+- `press_key` with Return, KP_Enter, or Enter (any modifiers) when the focused or targeted window belongs to a send-on-Enter app. The default list is telegram, whatsapp, slack, discord, signal, element, teams, thunderbird, evolution, geary. Set `TAKE_MY_COMPUTER_SEND_APPS` to a comma-separated list to replace it. Entries are case-insensitive substrings of the app id, wm class, or title. If the window is unknown, Enter needs confirmation.
+- `type_text` with a line break in a send-on-Enter app (or an unknown window), because a line break sends the message.
+- `perform_action` or `set_value` on an element that is not in the last `get_app_state` snapshot.
+- `setup_accessibility`, `setup_window_targeting`, and `run_shell`.
+
+`type_text` or `set_value` into a password field is refused in `confirm` mode. `screenshot` is gated only when it raises a window (a window target with `raise_window` not set to `false`).
+
+Confirmation uses these channels, in order:
+
+1. MCP elicitation, when the client declared the elicitation capability.
+2. A desktop dialog from `zenity --question` with a 60-second timeout.
+3. Otherwise the call is refused, and the message names the mode (`full`) that allows it.
+
+The dialog shows the tool, app, window title, element name, and the key or the text length. It never shows typed text. While the server waits, the agent's tool call is blocked, so the agent cannot answer the dialog.
+
+**Kill switch.** While the file `$XDG_STATE_HOME/take-my-computer/STOP` exists (default `~/.local/state/take-my-computer/STOP`), every mutating tool is refused in every mode and sends no input. `computer-use-linux stop` creates the file. `computer-use-linux resume` removes it. To bind `stop` to a GNOME keyboard shortcut (Ctrl+Alt+Esc in this example; use the absolute binary path if GNOME does not find it):
+
+```sh
+KEY=/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/take-my-computer-stop/
+LIST=org.gnome.settings-daemon.plugins.media-keys
+ITEM=$LIST.custom-keybinding:$KEY
+gsettings set "$ITEM" name 'take-my-computer stop'
+gsettings set "$ITEM" command 'computer-use-linux stop'
+gsettings set "$ITEM" binding '<Primary><Alt>Escape'
+current=$(gsettings get "$LIST" custom-keybindings)
+case "$current" in
+  *"$KEY"*) ;;
+  "@as []") gsettings set "$LIST" custom-keybindings "['$KEY']" ;;
+  *) gsettings set "$LIST" custom-keybindings "${current%]}, '$KEY']" ;;
+esac
+```
+
+**Input lock.** Each mutating call holds an exclusive `flock` on `$XDG_RUNTIME_DIR/take-my-computer-input.lock`, so two agents cannot interleave input inside one action.
+
+**Audit log.** The server appends one JSON line per mutating call to `$XDG_STATE_HOME/take-my-computer/audit.jsonl` (default `~/.local/state/take-my-computer/audit.jsonl`). Fields: `ts` (RFC 3339 UTC), `client`, `tool`, `mode`, `tier`, `decision` (`allowed`, `confirmed`, `denied`, or `refused`), `app`, `window_title`, `element_name`, `key`, `text_len`, `text_sha256`, `ok`, and `reason` when the call was rated high-impact. The log never holds typed text, only its length and SHA-256. Single-character keys are logged as `<char>`. The state directory has mode `0700` and the log has mode `0600`. If the log cannot be written, mutating calls are refused.
 
 ## Support matrix
 
@@ -455,6 +509,8 @@ Most setups need none of these — `doctor` and the installers pick sensible def
 
 | Variable | Effect |
 | --- | --- |
+| `TAKE_MY_COMPUTER_POLICY` | Safety gate mode: `confirm` (default), `full`, or `observe`. See [Safety gate](#safety-gate-take-my-computer). |
+| `TAKE_MY_COMPUTER_SEND_APPS` | Comma-separated, case-insensitive substrings of app id, wm class, or title. Replaces the default send-on-Enter app list. |
 | `COMPUTER_USE_LINUX_NOTIFY_ON_COMPLETE` | Set exactly to `1` to expose the optional `complete_interaction` notification tool. Requires `notify-send` and a desktop notification service; disabled by default. |
 | `COMPUTER_USE_LINUX_COSMIC_HELPER` | Path to the `computer-use-linux-cosmic` helper when it isn't next to the binary or on `PATH`. |
 | `COMPUTER_USE_LINUX_INDICATOR` | Set to `0` (or `false`/`off`/`no`) to turn off the on-screen indicator. On by default. |
