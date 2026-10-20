@@ -5,8 +5,8 @@ Thanks for helping improve Linux desktop control for MCP hosts.
 ## Development Setup
 
 ```bash
-git clone https://github.com/agent-sh/computer-use-linux.git
-cd computer-use-linux
+git clone https://github.com/RamaAditya49/take-my-computer.git
+cd take-my-computer
 cargo check --locked
 cargo test --locked
 ```

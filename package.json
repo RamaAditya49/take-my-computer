@@ -4,13 +4,13 @@
   "description": "Native Linux desktop control for AI agents (MCP server, Pi tools, and CLI): semantic AT-SPI accessibility trees, screenshots, compositor window targeting, Wayland/X11 input, and an on-screen activity indicator.",
   "license": "MIT",
   "type": "commonjs",
-  "homepage": "https://github.com/agent-sh/computer-use-linux#readme",
+  "homepage": "https://github.com/RamaAditya49/take-my-computer#readme",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/agent-sh/computer-use-linux.git"
+    "url": "git+https://github.com/RamaAditya49/take-my-computer.git"
   },
   "bugs": {
-    "url": "https://github.com/agent-sh/computer-use-linux/issues"
+    "url": "https://github.com/RamaAditya49/take-my-computer/issues"
   },
   "keywords": [
     "mcp",
