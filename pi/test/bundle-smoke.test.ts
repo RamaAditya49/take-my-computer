@@ -79,6 +79,8 @@ describe.runIf(binary)("generated MCP client bundle", () => {
 			),
 		);
 		env.COMPUTER_USE_LINUX_ENABLE_SHELL = "1";
+		// run_shell needs confirmation in the default mode; this test has no desktop to ask.
+		env.TAKE_MY_COMPUTER_POLICY = "full";
 		const client = new module.ComputerUseMcpClient({
 			binaryPath: binary,
 			clientVersion: GENERATED_SERVER_VERSION,

@@ -241,6 +241,8 @@ function runtimeEnvironment(): Record<string, string> {
 		"COMPUTER_USE_LINUX_PORTAL_SCROLL_INVERT",
 		"COMPUTER_USE_LINUX_SCREENSHOT_BACKEND",
 		"CU_DISABLE_ABS_POINTER",
+		"TAKE_MY_COMPUTER_POLICY",
+		"TAKE_MY_COMPUTER_SEND_APPS",
 	]);
 	const env = Object.fromEntries(
 		Object.entries(process.env).filter(

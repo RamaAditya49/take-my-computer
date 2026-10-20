@@ -11,6 +11,8 @@ describe.runIf(binary)("shell-enabled extension environment", () => {
 
 	it("does not expose unrelated Pi secrets through the MCP parent process", async () => {
 		vi.stubEnv("COMPUTER_USE_LINUX_ENABLE_SHELL", "1");
+		// run_shell needs confirmation in the default mode; this test has no desktop to ask.
+		vi.stubEnv("TAKE_MY_COMPUTER_POLICY", "full");
 		vi.stubEnv("COMPUTER_USE_LINUX_BIN", binary!);
 		vi.stubEnv("COMPUTER_USE_LINUX_TEST_SECRET", "must-not-leak");
 		vi.resetModules();
