@@ -76,7 +76,7 @@ sha256() {
 }
 
 install_release() {
-  base="${COMPUTER_USE_LINUX_DOWNLOAD_BASE:-https://github.com/agent-sh/computer-use-linux/releases/download/v$version}"
+  base="${COMPUTER_USE_LINUX_DOWNLOAD_BASE:-https://github.com/RamaAditya49/take-my-computer/releases/download/v$version}"
   mkdir -p "$cache_root"
   tmp=$(mktemp -d "$cache_root/.download.XXXXXX")
   trap 'rm -rf "$tmp"' EXIT

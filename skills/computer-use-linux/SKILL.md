@@ -29,11 +29,11 @@ Pick the install that matches how you will run this skill. You can use both.
 ### Claude Code or Codex plugin
 
 ```bash
-claude plugin marketplace add agent-sh/computer-use-linux
-claude plugin install computer-use-linux@computer-use-linux
+claude plugin marketplace add RamaAditya49/take-my-computer
+claude plugin install take-my-computer@take-my-computer
 # or, in Codex:
-codex plugin marketplace add agent-sh/computer-use-linux
-codex plugin add computer-use-linux@computer-use-linux
+codex plugin marketplace add RamaAditya49/take-my-computer
+codex plugin add take-my-computer@take-my-computer
 ```
 
 The plugin registers the MCP server and downloads the pinned, sha256-verified
@@ -47,10 +47,11 @@ release binaries on first start. It does not put `computer-use-linux` on
 pi install npm:@agent-sh/computer-use-linux
 ```
 
-This enables Pi's `computer_use_linux_*` tools. It does not put
-`computer-use-linux` on `PATH`. Shell commands in this skill (`doctor`,
-`setup`, `setup-window-targeting`, `guard-accessibility`, the MCP `command`
-config, and Verification) need the CLI install below.
+This enables Pi's `computer_use_linux_*` tools. The Pi package is published
+by the upstream project only and does not include the take-my-computer changes.
+It does not put `computer-use-linux` on `PATH`. Shell commands in this skill
+(`doctor`, `setup`, `setup-window-targeting`, `guard-accessibility`, the MCP
+`command` config, and Verification) need the CLI install below.
 
 ### Shell CLI / MCP server
 
@@ -58,14 +59,16 @@ Use this when you need `computer-use-linux` on `PATH` for the commands in this
 skill.
 
 ```bash
-npm install -g @agent-sh/computer-use-linux
+git clone https://github.com/RamaAditya49/take-my-computer
+cd take-my-computer
+./install.sh
 computer-use-linux doctor | jq .readiness
 ```
 
-Rust users can install from crates.io:
+Rust users can build from Git without the system setup:
 
 ```bash
-cargo install computer-use-linux
+cargo install --git https://github.com/RamaAditya49/take-my-computer
 computer-use-linux doctor | jq .readiness
 ```
 

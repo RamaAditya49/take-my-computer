@@ -1,15 +1,15 @@
 {
-  "name": "computer-use-linux",
+  "name": "take-my-computer",
   "owner": {
-    "name": "agent-sh",
-    "url": "https://github.com/agent-sh"
+    "name": "RamaAditya49",
+    "url": "https://github.com/RamaAditya49"
   },
   "metadata": {
     "description": "Native Linux desktop control for Claude Code and Codex."
   },
   "plugins": [
     {
-      "name": "computer-use-linux",
+      "name": "take-my-computer",
       "source": "./plugins/computer-use-linux",
       "description": "Native Linux desktop control: semantic AT-SPI accessibility trees, screenshots, compositor window targeting (GNOME, KDE, Hyprland, niri, COSMIC, i3, X11), Wayland/X11 input, and an on-screen activity indicator.",
       "version": "0.7.20-tmc.1",
