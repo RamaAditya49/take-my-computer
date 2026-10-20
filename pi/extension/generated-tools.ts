@@ -8,8 +8,8 @@ export interface GeneratedMcpToolDefinition {
 }
 
 export const GENERATED_SERVER_VERSION = "0.7.20";
-export const GENERATED_TOOL_CATALOG_HASH = "b9a6ef2736cd165b97982ec6ccf1e6cfb47712f0d4a8ae778ecac47e211b15ec";
-export const GENERATED_SHELL_TOOL_CATALOG_HASH = "113fc01364844db492475ec7ad00f1d03fe8e2d7acedc8a0aa3b48d245f99105";
+export const GENERATED_TOOL_CATALOG_HASH = "010e2b8fa8d9fb52ff732f49f5cf6ddef0ab62a492df9288a02aecf8d69783ed";
+export const GENERATED_SHELL_TOOL_CATALOG_HASH = "d1557fd80fb4826b9213822bb1b6a14bad11e4e4ad5557eb6554034cbb195d99";
 export const GENERATED_MCP_TOOLS =
 [
   {
@@ -1107,6 +1107,20 @@ export const GENERATED_MCP_TOOLS =
       "type": "object"
     },
     "name": "perform_action"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Report the safety policy: mode (confirm, full, or observe), kill switch state, the send-on-Enter app list, the confirmation channels, and the audit log path.",
+    "inputSchema": {
+      "properties": {},
+      "type": "object"
+    },
+    "name": "policy_status"
   },
   {
     "annotations": {
