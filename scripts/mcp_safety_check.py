@@ -19,6 +19,7 @@ from typing import Any
 
 EXPECTED_TOOLS = {
     "doctor",
+    "policy_status",
     "setup_accessibility",
     "setup_window_targeting",
     "list_apps",
@@ -117,6 +118,7 @@ POST_ACTION_CAPTURE_PROPS = {
 
 READ_ONLY_TOOLS = {
     "doctor",
+    "policy_status",
     "list_apps",
     "get_app_state",
     "list_windows",
@@ -146,6 +148,7 @@ IDEMPOTENT_TOOLS = READ_ONLY_TOOLS | {
 
 OPEN_WORLD_TOOLS = (EXPECTED_TOOLS | {SHELL_TOOL, COMPLETION_TOOL}) - {
     "doctor",
+    "policy_status",
     "setup_accessibility",
     "setup_window_targeting",
 }
@@ -384,6 +387,108 @@ def assert_screenshot_error_contract(binary: pathlib.Path) -> None:
                 client.close()
 
 
+def tool_payload(result: dict[str, Any]) -> dict[str, Any]:
+    structured = result.get("structuredContent")
+    if isinstance(structured, dict):
+        return structured
+    content = result.get("content") or []
+    if content and content[0].get("type") == "text":
+        return json.loads(content[0].get("text") or "{}")
+    raise AssertionError(f"tool result has no payload: {result!r}")
+
+def audit_records(state_home: str) -> list[dict[str, Any]]:
+    path = pathlib.Path(state_home, "take-my-computer", "audit.jsonl")
+    if not path.exists():
+        return []
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
+
+def assert_policy_gate_contract(binary: pathlib.Path) -> None:
+    """Refusals happen before any input, so these calls never touch the desktop."""
+    initialize_params = {
+        "protocolVersion": "2024-11-05",
+        "capabilities": {},
+        "clientInfo": {"name": "policy-gate-contract", "version": "0"},
+    }
+
+    # Observe mode refuses every mutating tool and writes an audit line.
+    with tempfile.TemporaryDirectory(prefix="tmc-policy-") as state_home:
+        client = McpClient(
+            binary,
+            {"TAKE_MY_COMPUTER_POLICY": "observe", "XDG_STATE_HOME": state_home},
+        )
+        try:
+            client.request("initialize", initialize_params)
+            client.notify("notifications/initialized", {})
+            status = tool_payload(
+                client.request("tools/call", {"name": "policy_status", "arguments": {}})["result"]
+            )
+            if status.get("mode") != "observe" or status.get("kill_switch_active") is not False:
+                raise AssertionError(f"unexpected policy_status: {status!r}")
+            for field in ["send_on_enter_apps", "audit_log", "kill_switch_file"]:
+                if not status.get(field):
+                    raise AssertionError(f"policy_status is missing {field}: {status!r}")
+            result = client.request(
+                "tools/call", {"name": "click", "arguments": {"x": 10, "y": 10}}
+            )["result"]
+            payload = tool_payload(result)
+            if payload.get("ok") is not False or "observe" not in (payload.get("message") or ""):
+                raise AssertionError(f"observe mode did not refuse click: {payload!r}")
+            records = audit_records(state_home)
+            if not records or records[-1].get("decision") != "refused" or records[-1].get("tool") != "click":
+                raise AssertionError(f"observe refusal was not audited: {records!r}")
+            # Every other mutating tool must refuse too, before any desktop access.
+            mutating_calls = {
+                "drag": {"start_x": 1, "start_y": 1, "end_x": 2, "end_y": 2},
+                "scroll": {"direction": "down"},
+                "press_key": {"key": "Escape"},
+                "type_text": {"text": "x"},
+                "perform_action": {"element_index": 1},
+                "set_value": {"element_index": 1, "value": "x"},
+                "activate_window": {"window_id": 1},
+                "move_window": {"window_id": 1, "x": 0, "y": 0},
+                "resize_window": {"window_id": 1, "width": 100, "height": 100},
+                "setup_accessibility": {},
+                "setup_window_targeting": {},
+                "screenshot": {"window_id": 1},
+            }
+            for name, arguments in mutating_calls.items():
+                payload = tool_payload(
+                    client.request("tools/call", {"name": name, "arguments": arguments})["result"]
+                )
+                if payload.get("ok") is not False or "observe" not in json.dumps(payload):
+                    raise AssertionError(f"observe mode did not refuse {name}: {payload!r}")
+            refused_tools = {
+                record["tool"] for record in audit_records(state_home) if record.get("decision") == "refused"
+            }
+            if refused_tools != {"click"} | set(mutating_calls):
+                raise AssertionError(f"observe refusals were not all audited: {sorted(refused_tools)!r}")
+        finally:
+            client.close()
+
+    # The kill switch refuses in every mode, including full.
+    with tempfile.TemporaryDirectory(prefix="tmc-policy-") as state_home:
+        stop = pathlib.Path(state_home, "take-my-computer", "STOP")
+        stop.parent.mkdir(parents=True)
+        stop.write_text("stop\n", encoding="utf-8")
+        client = McpClient(
+            binary,
+            {"TAKE_MY_COMPUTER_POLICY": "full", "XDG_STATE_HOME": state_home},
+        )
+        try:
+            client.request("initialize", initialize_params)
+            client.notify("notifications/initialized", {})
+            result = client.request(
+                "tools/call", {"name": "press_key", "arguments": {"key": "Escape"}}
+            )["result"]
+            payload = tool_payload(result)
+            if payload.get("ok") is not False or "kill switch" not in (payload.get("message") or ""):
+                raise AssertionError(f"kill switch did not refuse press_key: {payload!r}")
+        finally:
+            client.close()
+        records = audit_records(state_home)
+        if not records or records[-1].get("decision") != "refused":
+            raise AssertionError(f"kill switch refusal was not audited: {records!r}")
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", default="target/debug/computer-use-linux")
@@ -476,6 +581,7 @@ def main() -> int:
         client.close()
 
     assert_screenshot_error_contract(binary)
+    assert_policy_gate_contract(binary)
 
     notification_client = McpClient(binary, {"COMPUTER_USE_LINUX_NOTIFY_ON_COMPLETE": "1"})
     try:
@@ -495,6 +601,7 @@ def main() -> int:
         notification_client.close()
 
     shell_home = tempfile.TemporaryDirectory(prefix="computer-use-linux-shell-home-")
+    shell_state = tempfile.TemporaryDirectory(prefix="computer-use-linux-shell-state-")
     pathlib.Path(shell_home.name, ".profile").write_text(
         "export COMPUTER_USE_LINUX_PROFILE_SECRET=must-not-be-loaded\n",
         encoding="utf-8",
@@ -505,6 +612,10 @@ def main() -> int:
             "COMPUTER_USE_LINUX_ENABLE_SHELL": "1",
             "COMPUTER_USE_LINUX_TEST_SECRET": "must-not-be-inherited",
             "HOME": shell_home.name,
+            # The safety gate asks before it runs a shell command. This smoke
+            # test has no user, so it uses full mode and a private state dir.
+            "TAKE_MY_COMPUTER_POLICY": "full",
+            "XDG_STATE_HOME": shell_state.name,
         },
     )
     try:
@@ -555,6 +666,7 @@ def main() -> int:
     finally:
         shell_client.close()
         shell_home.cleanup()
+        shell_state.cleanup()
 
     print(
         f"MCP safety check passed: {len(EXPECTED_TOOLS)} default tools, "

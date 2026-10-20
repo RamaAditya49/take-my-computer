@@ -12,6 +12,10 @@ use crate::monitors::{
     monitor_point_to_desktop, CaptureRect, LayoutSource, MonitorCrop, MonitorLayout,
     MonitorSelector,
 };
+use crate::policy::{
+    client_supports_elicitation, ActionFacts, Mode, Permit, Policy, PolicyStatus, Refusal,
+    SystemPrompter,
+};
 use crate::remote_desktop::{
     click as portal_click, drag as portal_drag, keysyms_for_text, press_key_chord,
     press_keycode_chord, scroll as portal_scroll, start_portal_keyboard_session,
@@ -35,7 +39,7 @@ use rmcp::{
     handler::server::wrapper::{Json, Parameters},
     model::{CallToolResult, ContentBlock},
     schemars::JsonSchema,
-    tool, tool_handler, tool_router, ErrorData, ServerHandler, ServiceExt,
+    tool, tool_handler, tool_router, ErrorData, Peer, RoleServer, ServerHandler, ServiceExt,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -46,7 +50,7 @@ use std::{
     future::Future,
     path::Path,
     process::{Command, Output, Stdio},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
 use tokio::{
@@ -102,6 +106,11 @@ pub struct ComputerUseLinux {
     desktop_size: Arc<Mutex<Option<(u32, u32)>>>,
     /// On-screen activity overlay (opt-out via `COMPUTER_USE_LINUX_INDICATOR=0`).
     indicator: Arc<crate::indicator::Indicator>,
+    /// Safety gate that every mutating tool passes before it sends input.
+    policy: Policy,
+    /// The MCP client, for client name and confirmation requests. Set once
+    /// after the handshake in `serve_mcp`.
+    peer: Arc<OnceLock<Peer<RoleServer>>>,
 }
 
 fn sanitize_unsigned_integer_formats(value: &mut serde_json::Value) {
@@ -203,7 +212,23 @@ impl ComputerUseLinux {
     }
 
     #[tool(
+        name = "policy_status",
+        description = "Report the safety policy: mode (confirm, full, or observe), kill switch state, the send-on-Enter app list, the confirmation channels, and the audit log path.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn policy_status(&self) -> Json<PolicyStatus> {
+        let elicitation = self.peer.get().is_some_and(client_supports_elicitation);
+        Json(self.policy.status(elicitation))
+    }
+
+    #[tool(
         name = "setup_accessibility",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<SetupReport>(),
         description = "Enable GNOME accessibility through gsettings so Linux Computer Use can read AT-SPI trees.",
         annotations(
             read_only_hint = false,
@@ -212,16 +237,23 @@ impl ComputerUseLinux {
             open_world_hint = false
         )
     )]
-    async fn setup_accessibility(&self) -> Json<SetupReport> {
-        Json(
-            tokio::task::spawn_blocking(setup_accessibility_report)
-                .await
-                .expect("accessibility setup task panicked"),
-        )
+    async fn setup_accessibility(&self) -> Result<CallToolResult, ErrorData> {
+        let permit = match self.gate(ActionFacts::new("setup_accessibility")).await {
+            Ok(permit) => permit,
+            Err(refusal) => return Ok(refusal_result("setup_accessibility", &refusal)),
+        };
+        let report = tokio::task::spawn_blocking(setup_accessibility_report)
+            .await
+            .expect("accessibility setup task panicked");
+        let ok = report.accessibility_command.ok;
+        let result = structured_tool_result(report, None);
+        permit.finish(ok);
+        result
     }
 
     #[tool(
         name = "setup_window_targeting",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<WindowTargetingSetupReport>(),
         description = "Install and enable the optional GNOME Shell extension used for exact window list/focus targeting when GNOME blocks native introspection.",
         annotations(
             read_only_hint = false,
@@ -230,8 +262,16 @@ impl ComputerUseLinux {
             open_world_hint = false
         )
     )]
-    async fn setup_window_targeting(&self) -> Json<WindowTargetingSetupReport> {
-        Json(setup_window_targeting_report().await)
+    async fn setup_window_targeting(&self) -> Result<CallToolResult, ErrorData> {
+        let permit = match self.gate(ActionFacts::new("setup_window_targeting")).await {
+            Ok(permit) => permit,
+            Err(refusal) => return Ok(refusal_result("setup_window_targeting", &refusal)),
+        };
+        let report = setup_window_targeting_report().await;
+        let ok = report.enable_command.ok;
+        let result = structured_tool_result(report, None);
+        permit.finish(ok);
+        result
     }
 
     #[tool(
@@ -347,9 +387,34 @@ impl ComputerUseLinux {
     ) -> Result<CallToolResult, ErrorData> {
         let capture = params.capture.clone();
         let target = params.clone().into_target();
-        let Json(output) = self.dispatch_activate_window(params).await;
-        self.finish_activate_window_output(output, &capture, &target)
+        let window = self.gate_window(Some(&target), false).await;
+        let permit = match self
+            .gate(Self::facts_with_window("activate_window", window.as_ref()))
             .await
+        {
+            Ok(permit) => permit,
+            Err(refusal) => {
+                let output = ActivateWindowOutput {
+                    ok: false,
+                    implemented: true,
+                    backend: GNOME_SHELL_INTROSPECT_BACKEND.to_string(),
+                    focus: None,
+                    error: Some(refusal.message),
+                    permissions_hint: None,
+                    received: None,
+                };
+                return self
+                    .finish_activate_window_output(output, &capture, &target)
+                    .await;
+            }
+        };
+        let Json(output) = self.dispatch_activate_window(params).await;
+        let ok = output.ok;
+        let result = self
+            .finish_activate_window_output(output, &capture, &target)
+            .await;
+        permit.finish(ok);
+        result
     }
 
     async fn dispatch_activate_window(
@@ -632,11 +697,30 @@ impl ComputerUseLinux {
         )
     )]
     async fn screenshot(&self, Parameters(params): Parameters<ScreenshotParams>) -> CallToolResult {
+        // A capture that raises a window changes focus, so only that form is
+        // gated. A capture with no window target or with raise_window=false
+        // only reads pixels.
+        let permit = match params.window_target() {
+            Some(target) if params.raise_window.unwrap_or(true) => {
+                let window = self.gate_window(Some(&target), false).await;
+                match self
+                    .gate(Self::facts_with_window("screenshot", window.as_ref()))
+                    .await
+                {
+                    Ok(permit) => Some(permit),
+                    Err(refusal) => return refusal_result("screenshot", &refusal),
+                }
+            }
+            _ => None,
+        };
         let result = match self.capture_screenshot(params).await {
             Ok(result) => result,
             Err(error) => CallToolResult::error(vec![ContentBlock::text(format!("{error:#}"))]),
         };
         self.indicator.action("screenshot").await;
+        if let Some(permit) = permit {
+            permit.finish(result.is_error != Some(true));
+        }
         result
     }
 
@@ -809,9 +893,37 @@ impl ComputerUseLinux {
     ) -> Result<CallToolResult, ErrorData> {
         let capture = params.capture.clone();
         let target = params.window_target();
+        let by_element = params.x.zip(params.y).is_none();
+        let window = self.gate_window(target.as_ref(), by_element).await;
+        let mut facts = Self::facts_with_window("click", window.as_ref());
+        if by_element {
+            let element = self.gate_element(
+                params.element_index,
+                None,
+                &params.selector(),
+                ElementResolvePurpose::Click,
+            );
+            facts = Self::facts_with_element(facts, &element);
+        }
+        let permit = match self.gate(facts).await {
+            Ok(permit) => permit,
+            Err(refusal) => {
+                return self
+                    .finish_action_output(
+                        refused_output("click", &refusal),
+                        &capture,
+                        target.as_ref(),
+                    )
+                    .await;
+            }
+        };
         let Json(output) = self.dispatch_click(params).await;
-        self.finish_action_output(output, &capture, target.as_ref())
-            .await
+        let ok = output.ok;
+        let result = self
+            .finish_action_output(output, &capture, target.as_ref())
+            .await;
+        permit.finish(ok);
+        result
     }
 
     async fn dispatch_click(&self, mut params: ClickParams) -> Json<ActionOutput> {
@@ -1179,10 +1291,36 @@ impl ComputerUseLinux {
     ) -> Result<CallToolResult, ErrorData> {
         let capture = params.capture.clone();
         let requested_action = requested_or_primary_action(params.action.as_deref());
+        let window = self.gate_window(None, true).await;
+        let element = self.gate_element(
+            params.element_index,
+            params.element_identifier.as_deref(),
+            &params.selector(),
+            ElementResolvePurpose::Action,
+        );
+        let facts = Self::facts_with_element(
+            Self::facts_with_window("perform_action", window.as_ref()),
+            &element,
+        );
+        let permit = match self.gate(facts).await {
+            Ok(permit) => permit,
+            Err(refusal) => {
+                return self
+                    .finish_action_output(
+                        refused_output("perform_action", &refusal),
+                        &capture,
+                        None,
+                    )
+                    .await;
+            }
+        };
         let Json(output) = self
             .perform_element_action(&params, Some(requested_action))
             .await;
-        self.finish_action_output(output, &capture, None).await
+        let ok = output.ok;
+        let result = self.finish_action_output(output, &capture, None).await;
+        permit.finish(ok);
+        result
     }
 
     #[tool(
@@ -1201,8 +1339,31 @@ impl ComputerUseLinux {
         Parameters(params): Parameters<SetValueParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let capture = params.capture.clone();
+        let window = self.gate_window(None, true).await;
+        let element = self.gate_element(
+            params.element_index,
+            params.element_identifier.as_deref(),
+            &params.selector(),
+            ElementResolvePurpose::SetValue,
+        );
+        let facts = Self::facts_with_element(
+            Self::facts_with_window("set_value", window.as_ref()),
+            &element,
+        )
+        .with_text(&params.value);
+        let permit = match self.gate(facts).await {
+            Ok(permit) => permit,
+            Err(refusal) => {
+                return self
+                    .finish_action_output(refused_output("set_value", &refusal), &capture, None)
+                    .await;
+            }
+        };
         let Json(output) = self.dispatch_set_value(params).await;
-        self.finish_action_output(output, &capture, None).await
+        let ok = output.ok;
+        let result = self.finish_action_output(output, &capture, None).await;
+        permit.finish(ok);
+        result
     }
 
     async fn dispatch_set_value(&self, params: SetValueParams) -> Json<ActionOutput> {
@@ -1269,9 +1430,29 @@ impl ComputerUseLinux {
     ) -> Result<CallToolResult, ErrorData> {
         let capture = params.capture.clone();
         let target = params.window_target();
-        let Json(output) = self.dispatch_scroll(params).await;
-        self.finish_action_output(output, &capture, target.as_ref())
+        let window = self.gate_window(target.as_ref(), false).await;
+        let permit = match self
+            .gate(Self::facts_with_window("scroll", window.as_ref()))
             .await
+        {
+            Ok(permit) => permit,
+            Err(refusal) => {
+                return self
+                    .finish_action_output(
+                        refused_output("scroll", &refusal),
+                        &capture,
+                        target.as_ref(),
+                    )
+                    .await;
+            }
+        };
+        let Json(output) = self.dispatch_scroll(params).await;
+        let ok = output.ok;
+        let result = self
+            .finish_action_output(output, &capture, target.as_ref())
+            .await;
+        permit.finish(ok);
+        result
     }
 
     async fn dispatch_scroll(&self, mut params: ScrollParams) -> Json<ActionOutput> {
@@ -1650,8 +1831,23 @@ impl ComputerUseLinux {
         Parameters(params): Parameters<DragParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let capture = params.capture.clone();
+        let window = self.gate_window(None, false).await;
+        let permit = match self
+            .gate(Self::facts_with_window("drag", window.as_ref()))
+            .await
+        {
+            Ok(permit) => permit,
+            Err(refusal) => {
+                return self
+                    .finish_action_output(refused_output("drag", &refusal), &capture, None)
+                    .await;
+            }
+        };
         let Json(output) = self.dispatch_drag(params).await;
-        self.finish_action_output(output, &capture, None).await
+        let ok = output.ok;
+        let result = self.finish_action_output(output, &capture, None).await;
+        permit.finish(ok);
+        result
     }
 
     async fn dispatch_drag(&self, mut params: DragParams) -> Json<ActionOutput> {
@@ -1800,9 +1996,27 @@ impl ComputerUseLinux {
     ) -> Result<CallToolResult, ErrorData> {
         let capture = params.capture.clone();
         let target = params.window_target();
+        let window = self.gate_window(Some(&target), false).await;
+        let facts = Self::facts_with_window("press_key", window.as_ref()).with_key(&params.key);
+        let permit = match self.gate(facts).await {
+            Ok(permit) => permit,
+            Err(refusal) => {
+                return self
+                    .finish_action_output(
+                        refused_output("press_key", &refusal),
+                        &capture,
+                        Some(&target),
+                    )
+                    .await;
+            }
+        };
         let Json(output) = self.dispatch_press_key(params).await;
-        self.finish_action_output(output, &capture, Some(&target))
-            .await
+        let ok = output.ok;
+        let result = self
+            .finish_action_output(output, &capture, Some(&target))
+            .await;
+        permit.finish(ok);
+        result
     }
 
     async fn dispatch_press_key(&self, params: PressKeyParams) -> Json<ActionOutput> {
@@ -1945,7 +2159,25 @@ impl ComputerUseLinux {
         &self,
         Parameters(params): Parameters<RunShellParams>,
     ) -> Json<RunShellOutput> {
-        Json(execute_shell(params).await)
+        let facts = ActionFacts::new("run_shell").with_command(&params.command);
+        let permit = match self.gate(facts).await {
+            Ok(permit) => permit,
+            Err(refusal) => {
+                return Json(shell_error_output(
+                    shell_command_sha256(&params.command),
+                    params.cwd.clone().unwrap_or_default(),
+                    params
+                        .timeout_seconds
+                        .unwrap_or(SHELL_DEFAULT_TIMEOUT_SECS)
+                        .min(SHELL_MAX_TIMEOUT_SECS),
+                    refusal.message,
+                ));
+            }
+        };
+        let output = execute_shell(params).await;
+        let ok = output.ok;
+        permit.finish(ok);
+        Json(output)
     }
 
     #[tool(
@@ -1965,14 +2197,40 @@ impl ComputerUseLinux {
     ) -> Result<CallToolResult, ErrorData> {
         let capture = params.capture.clone();
         let target = params.window_target();
+        let window = self.gate_window(Some(&target), false).await;
+        let mut facts =
+            Self::facts_with_window("type_text", window.as_ref()).with_text(&params.text);
+        if self.policy.mode() == Mode::Confirm {
+            // Only the confirm mode refuses password fields, so only it pays
+            // for the focus probe.
+            if let Some(element) = self.gate_focused_element(window.as_ref()).await {
+                facts = facts.with_element(Some(&element.role), element.name.as_deref(), None);
+            }
+        }
+        let permit = match self.gate(facts).await {
+            Ok(permit) => permit,
+            Err(refusal) => {
+                return self
+                    .finish_action_output(
+                        refused_output("type_text", &refusal),
+                        &capture,
+                        Some(&target),
+                    )
+                    .await;
+            }
+        };
         let Json(mut output) = self.dispatch_type_text(params).await;
+        let ok = output.ok;
         if output.ok {
             output.message.push_str(
                 " Field contents were not verified; re-observe the target before retrying.",
             );
         }
-        self.finish_action_output(output, &capture, Some(&target))
-            .await
+        let result = self
+            .finish_action_output(output, &capture, Some(&target))
+            .await;
+        permit.finish(ok);
+        result
     }
 
     async fn dispatch_type_text(&self, params: TypeTextParams) -> Json<ActionOutput> {
@@ -2223,14 +2481,34 @@ impl ComputerUseLinux {
         let capture = params.target.capture.clone();
         let received = Some(serde_json::json!(params.clone()));
         let target = params.target.into_target();
+        let window = self.gate_window(Some(&target), false).await;
+        let permit = match self
+            .gate(Self::facts_with_window("move_window", window.as_ref()))
+            .await
+        {
+            Ok(permit) => permit,
+            Err(refusal) => {
+                return self
+                    .finish_window_geometry_output(
+                        refused_geometry_output(refusal),
+                        &capture,
+                        &target,
+                    )
+                    .await;
+            }
+        };
         self.indicator.action("move_window").await;
         let Json(output) = self
             .window_geometry_op(received, &target, |window| async move {
                 registry::move_window(&window, params.x, params.y).await
             })
             .await;
-        self.finish_window_geometry_output(output, &capture, &target)
-            .await
+        let ok = output.ok;
+        let result = self
+            .finish_window_geometry_output(output, &capture, &target)
+            .await;
+        permit.finish(ok);
+        result
     }
 
     #[tool(
@@ -2251,14 +2529,34 @@ impl ComputerUseLinux {
         let capture = params.target.capture.clone();
         let received = Some(serde_json::json!(params.clone()));
         let target = params.target.into_target();
+        let window = self.gate_window(Some(&target), false).await;
+        let permit = match self
+            .gate(Self::facts_with_window("resize_window", window.as_ref()))
+            .await
+        {
+            Ok(permit) => permit,
+            Err(refusal) => {
+                return self
+                    .finish_window_geometry_output(
+                        refused_geometry_output(refusal),
+                        &capture,
+                        &target,
+                    )
+                    .await;
+            }
+        };
         self.indicator.action("resize_window").await;
         let Json(output) = self
             .window_geometry_op(received, &target, |window| async move {
                 registry::resize_window(&window, params.width, params.height).await
             })
             .await;
-        self.finish_window_geometry_output(output, &capture, &target)
-            .await
+        let ok = output.ok;
+        let result = self
+            .finish_window_geometry_output(output, &capture, &target)
+            .await;
+        permit.finish(ok);
+        result
     }
 }
 
@@ -2270,7 +2568,7 @@ impl ComputerUseLinux {
     // can't be env!("CARGO_PKG_VERSION"); the MCP safety check (CI) fails the
     // build if it drifts from the Cargo version.
     version = "0.7.20-tmc.1",
-    instructions = "Begin every turn that uses Computer Use by calling get_app_state. If diagnostics report disabled GNOME accessibility, call setup_accessibility before asking the user to retry. Use list_windows/focused_window before targeted keyboard input. If diagnostics report windowing.can_list_windows=false on GNOME, call setup_window_targeting to install the optional GNOME Shell extension backend, then ask the user to log out and back in if the setup report says a shell reload is required. This Linux backend can capture size-bounded screenshots through GNOME Shell or XDG Desktop Portal, read AT-SPI trees with action/value metadata, invoke native AT-SPI actions, set AT-SPI values or editable text, list/focus compositor windows through registered Linux window backends when the session permits it, attach best-effort terminal tty/process metadata to terminal windows, send coordinate or element-targeted click/scroll/drag input through the Wayland remote desktop portal when available, and send literal type_text through KDE clipboard integration on Plasma Wayland, wtype on compatible Wayland compositors, or portal keysyms on other Wayland sessions. Portal text startup or conversion failures return an error without replaying through ydotool. GNOME preflights the complete text against every configured keyboard layout group because the background reader cannot establish the active group; rejected text can use set_value on an editable field. Raw ydotool text is limited to printable ASCII, tab and newline, uses US physical key positions, and requires checking the resulting field contents under the active layout. Screenshot results include width/height for the returned image plus coordinate_width/coordinate_height and scale for desktop coordinate conversion; request more detail with max_width, max_height, max_bytes, format=jpeg, quality, or a smaller target/crop instead of relying on unbounded screenshots. Mutating tools (click, type_text, press_key, scroll, drag, perform_action, set_value, activate_window, move_window, resize_window) accept optional screenshot_after (true, \"screen\", or \"window\") with format/quality/scale/max_width/max_height/max_bytes and optional include_tree=true to return post-action observation in the same tool call. Tools with readOnlyHint=false may mutate local desktop or application state; hosts should require approval for actions that can submit, delete, send, purchase, or overwrite data. For element-targeted actions, prefer element_index from the latest get_app_state result; click, perform_action, and set_value can also use semantic role/name/text/states selectors when the target is unique. type_text and press_key accept optional window_id, pid, app_id, wm_class, title, tty, terminal_pid, terminal_command, or terminal_cwd selectors and refuse targeted input if focus cannot be verified. After targeted keyboard input, results append focused-element feedback from AT-SPI (role, name, editable) and warn when a concrete non-terminal focus is not editable. Exact window focus alone does not suppress a missing-focus warning; only a complete scoped tree containing window/menu chrome without content makes it informational. Terminals accept keyboard input without an EditableText interface. On Hyprland, wtype uses a single literal argument after -- to avoid stdin keymap-refresh corruption; text is visible in process arguments, so confirmed password fields are rejected (use set_value). Terminals and ambiguous fields, with or without AT-SPI, use private stdin for at most 100 Unicode characters per call; split larger input into smaller calls or expose accessibility. Input classification has its own 1500 ms budget, independent of the 250 ms cosmetic indicator timeout. Other compatible compositors retain stdin. The wtype path rejects NUL and more than 131071 UTF-8 bytes before focus or indicators. X11 xdotool can silently substitute symbols under non-US XKB layouts (reported with br/ABNT2) or changing keymap state; inspect the text before pressing Enter or submitting it. A successful type_text result confirms dispatch only; every text backend leaves field contents unverified. Re-observe the target before retrying. Screenshot, click, and input results warn when the target window or coordinate is partially or fully off-screen; use move_window/resize_window (GNOME Shell extension backend) to bring a window fully on-screen before retrying. scroll accepts the same window targeting and relative coordinates as click. get_app_state returns a compact readiness block by default; pass verbose=true for the full diagnostics dump. Scope get_app_state with app_name_or_bundle_identifier or a window target (window_id, pid, app_id, wm_class, title); without one it returns the whole desktop AT-SPI tree, reports tree_scoped=false, and warns in message, which can flood context. accessibility_tree_truncated=true means the node, depth, or read budget stopped traversal with unread elements left; recover by scoping to a narrower app or window target and raising max_nodes or max_depth (hard caps 2000 and 64), not by lowering max_nodes. Electron apps with only window/menu chrome may need --force-renderer-accessibility to expose renderer content."
+    instructions = "Begin every turn that uses Computer Use by calling get_app_state. If diagnostics report disabled GNOME accessibility, call setup_accessibility before asking the user to retry. Use list_windows/focused_window before targeted keyboard input. If diagnostics report windowing.can_list_windows=false on GNOME, call setup_window_targeting to install the optional GNOME Shell extension backend, then ask the user to log out and back in if the setup report says a shell reload is required. This Linux backend can capture size-bounded screenshots through GNOME Shell or XDG Desktop Portal, read AT-SPI trees with action/value metadata, invoke native AT-SPI actions, set AT-SPI values or editable text, list/focus compositor windows through registered Linux window backends when the session permits it, attach best-effort terminal tty/process metadata to terminal windows, send coordinate or element-targeted click/scroll/drag input through the Wayland remote desktop portal when available, and send literal type_text through KDE clipboard integration on Plasma Wayland, wtype on compatible Wayland compositors, or portal keysyms on other Wayland sessions. Portal text startup or conversion failures return an error without replaying through ydotool. GNOME preflights the complete text against every configured keyboard layout group because the background reader cannot establish the active group; rejected text can use set_value on an editable field. Raw ydotool text is limited to printable ASCII, tab and newline, uses US physical key positions, and requires checking the resulting field contents under the active layout. Screenshot results include width/height for the returned image plus coordinate_width/coordinate_height and scale for desktop coordinate conversion; request more detail with max_width, max_height, max_bytes, format=jpeg, quality, or a smaller target/crop instead of relying on unbounded screenshots. Mutating tools (click, type_text, press_key, scroll, drag, perform_action, set_value, activate_window, move_window, resize_window) accept optional screenshot_after (true, \"screen\", or \"window\") with format/quality/scale/max_width/max_height/max_bytes and optional include_tree=true to return post-action observation in the same tool call. Tools with readOnlyHint=false may mutate local desktop or application state; hosts should require approval for actions that can submit, delete, send, purchase, or overwrite data. For element-targeted actions, prefer element_index from the latest get_app_state result; click, perform_action, and set_value can also use semantic role/name/text/states selectors when the target is unique. type_text and press_key accept optional window_id, pid, app_id, wm_class, title, tty, terminal_pid, terminal_command, or terminal_cwd selectors and refuse targeted input if focus cannot be verified. After targeted keyboard input, results append focused-element feedback from AT-SPI (role, name, editable) and warn when a concrete non-terminal focus is not editable. Exact window focus alone does not suppress a missing-focus warning; only a complete scoped tree containing window/menu chrome without content makes it informational. Terminals accept keyboard input without an EditableText interface. On Hyprland, wtype uses a single literal argument after -- to avoid stdin keymap-refresh corruption; text is visible in process arguments, so confirmed password fields are rejected (use set_value). Terminals and ambiguous fields, with or without AT-SPI, use private stdin for at most 100 Unicode characters per call; split larger input into smaller calls or expose accessibility. Input classification has its own 1500 ms budget, independent of the 250 ms cosmetic indicator timeout. Other compatible compositors retain stdin. The wtype path rejects NUL and more than 131071 UTF-8 bytes before focus or indicators. X11 xdotool can silently substitute symbols under non-US XKB layouts (reported with br/ABNT2) or changing keymap state; inspect the text before pressing Enter or submitting it. A successful type_text result confirms dispatch only; every text backend leaves field contents unverified. Re-observe the target before retrying. Screenshot, click, and input results warn when the target window or coordinate is partially or fully off-screen; use move_window/resize_window (GNOME Shell extension backend) to bring a window fully on-screen before retrying. scroll accepts the same window targeting and relative coordinates as click. get_app_state returns a compact readiness block by default; pass verbose=true for the full diagnostics dump. Scope get_app_state with app_name_or_bundle_identifier or a window target (window_id, pid, app_id, wm_class, title); without one it returns the whole desktop AT-SPI tree, reports tree_scoped=false, and warns in message, which can flood context. accessibility_tree_truncated=true means the node, depth, or read budget stopped traversal with unread elements left; recover by scoping to a narrower app or window target and raising max_nodes or max_depth (hard caps 2000 and 64), not by lowering max_nodes. Electron apps with only window/menu chrome may need --force-renderer-accessibility to expose renderer content. Call list_monitors to see each monitor (index, connector, position, size, primary). To capture one monitor at native size, pass monitor (an index, a connector name, or \"primary\") to screenshot or get_app_state. Monitor screenshots add monitor, origin_x, and origin_y to the metadata: desktop x = origin_x + preview x / scale. Pass monitor to click, drag, or scroll to measure x and y from the top-left corner of that monitor. The server rejects a point outside the monitor. Do not combine monitor with a window target or with relative: true. Mutating tools pass a safety gate in the server. Call policy_status to read the mode (confirm, full, or observe), the kill switch state, and the send-on-Enter app list. In confirm mode, high-impact calls need user confirmation: click or perform_action on a control named like send, submit, delete, pay, kirim, hapus, or bayar; Enter in a messaging app; setup_accessibility, setup_window_targeting, and run_shell. A refused call returns ok=false with a reason. Do not retry it and do not try to bypass the gate. Tell the user which mode or confirmation allows it. Typing into a password field is refused in confirm mode. The operator can stop all input with the kill switch (computer-use-linux stop). screenshot with a window target raises that window, so observe mode refuses it. Use raise_window=false to capture without changing focus."
 )]
 impl ServerHandler for ComputerUseLinux {}
 
@@ -2550,11 +2848,17 @@ async fn execute_shell(params: RunShellParams) -> RunShellOutput {
 
 pub async fn serve_mcp() -> Result<()> {
     let server = ComputerUseLinux::default();
+    if let Some(warning) = server.policy.config().warning.as_deref() {
+        eprintln!("[take-my-computer] {warning}");
+    }
     let indicator = Arc::clone(&server.indicator);
+    let gate_peer = Arc::clone(&server.peer);
     let running = server.serve(rmcp::transport::stdio()).await?;
     // Legacy initialization supplies the client name through the peer.
     // Discovery-only hosts use the indicator's configured name or Agent fallback.
     indicator.attach(running.peer().clone());
+    // The gate uses the same peer for the client name and confirmation requests.
+    let _ = gate_peer.set(running.peer().clone());
     running.waiting().await?;
     Ok(())
 }
@@ -3503,7 +3807,176 @@ struct ActionToolOutput {
     observation: PostActionObservation,
 }
 
+/// An element that a tool is about to act on, as the gate sees it.
+struct GateElement {
+    node: Option<AccessibilityNode>,
+    /// The call named an element identifier that the cached tree does not hold.
+    unresolved: bool,
+}
+
+/// Upper bound for the read-only lookups that feed the gate.
+const GATE_LOOKUP_TIMEOUT: Duration = Duration::from_millis(1500);
+
+fn refused_output(tool: &str, refusal: &Refusal) -> ActionOutput {
+    ActionOutput {
+        ok: false,
+        implemented: true,
+        action: tool.to_string(),
+        message: refusal.message.clone(),
+        received: None,
+    }
+}
+
+fn refused_geometry_output(refusal: Refusal) -> WindowGeometryOutput {
+    WindowGeometryOutput {
+        ok: false,
+        implemented: true,
+        backend: "unknown".to_string(),
+        window: None,
+        message: refusal.message,
+        permissions_hint: None,
+        received: None,
+    }
+}
+
+/// Result for a refused tool whose normal output has no `ok` field.
+fn refusal_result(tool: &str, refusal: &Refusal) -> CallToolResult {
+    CallToolResult::structured_error(serde_json::json!({
+        "ok": false,
+        "implemented": true,
+        "action": tool,
+        "message": refusal.message,
+    }))
+}
+
 impl ComputerUseLinux {
+    fn client_name(&self) -> String {
+        self.peer
+            .get()
+            .and_then(Peer::peer_info)
+            .map(|info| info.client_info.name.clone())
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| "unknown".to_string())
+    }
+
+    /// Run the safety gate. Every mutating tool calls this before it changes
+    /// focus, shows an indicator event, or sends input.
+    async fn gate(&self, facts: ActionFacts) -> std::result::Result<Permit, Refusal> {
+        let prompter = SystemPrompter::new(self.peer.get().cloned());
+        self.policy
+            .begin(facts, &self.client_name(), &prompter)
+            .await
+    }
+
+    fn facts_with_window(tool: &'static str, window: Option<&WindowInfo>) -> ActionFacts {
+        ActionFacts::new(tool).with_window(
+            window.and_then(|window| window.app_id.as_deref()),
+            window.and_then(|window| window.wm_class.as_deref()),
+            window.and_then(|window| window.title.as_deref()),
+        )
+    }
+
+    fn facts_with_element(facts: ActionFacts, element: &GateElement) -> ActionFacts {
+        let facts = match element.node.as_ref() {
+            Some(node) => facts.with_element(
+                Some(&node.role),
+                node.name.as_deref(),
+                node.description.as_deref(),
+            ),
+            None => facts,
+        };
+        facts.with_unresolved_element(element.unresolved)
+    }
+
+    /// The window the gate shows and audits. It is the named target, else the
+    /// window of the cached snapshot for element calls, else the focused
+    /// window. Read-only, bounded, and best effort: `None` means unknown.
+    async fn gate_window(
+        &self,
+        target: Option<&WindowTarget>,
+        by_element: bool,
+    ) -> Option<WindowInfo> {
+        // A refused call needs no lookup. This also keeps the observe mode
+        // and the kill switch from touching the desktop at all.
+        if self.policy.mode() == Mode::Observe || self.policy.config().kill_switch_active() {
+            return None;
+        }
+        let snapshot_pid = by_element
+            .then(|| self.last_snapshot.lock().ok().and_then(|cached| cached.pid))
+            .flatten();
+        let lookup = async {
+            if let Some(target) = target.filter(|target| target.has_target()) {
+                let windows = list_windows().await.ok()?;
+                return resolve_window_target(&windows, target).ok().cloned();
+            }
+            if let Some(pid) = snapshot_pid {
+                if let Ok(windows) = list_windows().await {
+                    let owned: Vec<&WindowInfo> = windows
+                        .iter()
+                        .filter(|window| window.pid == Some(pid))
+                        .collect();
+                    if let Some(window) = owned
+                        .iter()
+                        .find(|window| window.focused)
+                        .or_else(|| owned.first())
+                    {
+                        return Some((*window).clone());
+                    }
+                }
+            }
+            focused_window().await.ok().flatten()
+        };
+        timeout(GATE_LOOKUP_TIMEOUT, lookup).await.ok().flatten()
+    }
+
+    /// Resolve the element from the cached tree, as the tool itself will.
+    /// A resolution error is left to the tool: it fails before any input.
+    fn gate_element(
+        &self,
+        element_index: Option<u32>,
+        element_identifier: Option<&str>,
+        selector: &ElementSelector<'_>,
+        purpose: ElementResolvePurpose,
+    ) -> GateElement {
+        if let Some(identifier) = element_identifier
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            let node = self.last_snapshot.lock().ok().and_then(|cached| {
+                cached
+                    .nodes
+                    .iter()
+                    .find(|node| node.object_ref == identifier)
+                    .cloned()
+            });
+            return GateElement {
+                unresolved: node.is_none(),
+                node,
+            };
+        }
+        GateElement {
+            node: self
+                .resolve_cached_node(element_index, selector, purpose)
+                .ok(),
+            unresolved: false,
+        }
+    }
+
+    /// The focused element in the window's app, for the password check.
+    async fn gate_focused_element(
+        &self,
+        window: Option<&WindowInfo>,
+    ) -> Option<FocusedElementSummary> {
+        let pid = window?.pid?;
+        if self.policy.config().kill_switch_active() {
+            return None;
+        }
+        match timeout(GATE_LOOKUP_TIMEOUT, probe_focused_element(Some(pid))).await {
+            Ok(Ok(FocusProbe::Found(element))) => Some(element),
+            _ => None,
+        }
+    }
+
     fn is_wayland_session(&self) -> bool {
         crate::diagnostics::hydrate_session_bus_env();
         let session_type = env::var("XDG_SESSION_TYPE").ok();
@@ -7529,6 +8002,142 @@ printf '%s %s\n' "${0##*/}" "$*" >> "$CUL_POINTER_TEST_LOG"
         drop(reader);
         let _ = tokio::time::timeout(Duration::from_secs(10), server).await;
         responses
+    }
+
+    /// One newline-delimited JSON frame from the in-process server.
+    async fn read_frame<R>(reader: &mut tokio::io::BufReader<R>) -> serde_json::Value
+    where
+        R: tokio::io::AsyncRead + Unpin,
+    {
+        use tokio::io::AsyncBufReadExt;
+        let mut line = String::new();
+        let read = tokio::time::timeout(Duration::from_secs(10), reader.read_line(&mut line))
+            .await
+            .expect("server should answer in time")
+            .unwrap();
+        assert!(read > 0, "server closed the stream");
+        serde_json::from_str(&line).unwrap()
+    }
+
+    /// The gate asks through MCP elicitation when the client declares it. The
+    /// call is `perform_action` on an element that is not in the cached tree,
+    /// so an approved call fails inside AT-SPI and never sends input.
+    #[tokio::test]
+    async fn elicitation_confirms_high_impact_calls_over_mcp() {
+        use tokio::io::{AsyncWriteExt, BufReader};
+        let dir = std::env::temp_dir().join(format!("tmc-elicit-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut config = crate::policy::PolicyConfig::from_lookup(|_| None);
+        config.mode = Mode::Confirm;
+        config.state_dir = dir.join("state");
+        config.lock_path = dir.join("run").join("input.lock");
+        let policy = Policy::new(config);
+        let server = ComputerUseLinux {
+            policy: policy.clone(),
+            ..ComputerUseLinux::default()
+        };
+        let gate_peer = Arc::clone(&server.peer);
+        let (server_transport, client_transport) = tokio::io::duplex(1 << 20);
+        let handle = tokio::spawn(async move {
+            if let Ok(running) = server.serve(server_transport).await {
+                let _ = gate_peer.set(running.peer().clone());
+                let _ = running.waiting().await;
+            }
+        });
+        let (read, mut write) = tokio::io::split(client_transport);
+        let mut reader = BufReader::new(read);
+        let send = |frame: serde_json::Value| {
+            let mut line = frame.to_string();
+            line.push('\n');
+            line
+        };
+
+        write
+            .write_all(
+                send(
+                    serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+                    "protocolVersion":"2025-06-18",
+                    "capabilities":{"elicitation":{}},
+                    "clientInfo":{"name":"elicit-test","version":"0"}}}),
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(read_frame(&mut reader).await["id"], 1);
+        write
+            .write_all(
+                send(serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized"}))
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+
+        for (id, answer) in [(2, "accept"), (3, "decline")] {
+            write
+                .write_all(
+                    send(serde_json::json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{
+                        "name":"perform_action",
+                        "arguments":{"element_identifier":":1.99999/org/a11y/atspi/accessible/none"}}}))
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let request = loop {
+                let frame = read_frame(&mut reader).await;
+                if frame["method"] == "elicitation/create" {
+                    break frame;
+                }
+            };
+            let message = request["params"]["message"].as_str().unwrap();
+            assert!(
+                message.contains("elicit-test wants to run perform_action."),
+                "{message}"
+            );
+            assert!(message.contains("Allow this action?"), "{message}");
+            write
+                .write_all(
+                    send(
+                        serde_json::json!({"jsonrpc":"2.0","id":request["id"],"result":{
+                        "action":answer,"content":{}}}),
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let response = loop {
+                let frame = read_frame(&mut reader).await;
+                if frame["id"] == id && frame.get("method").is_none() {
+                    break frame;
+                }
+            };
+            let output = &response["result"]["structuredContent"];
+            assert_eq!(output["ok"], false, "{response}");
+            let text = output["message"].as_str().unwrap();
+            if answer == "decline" {
+                assert!(text.contains("declined"), "{text}");
+            } else {
+                // Approved: the call reached AT-SPI, which rejects the unknown element.
+                assert!(!text.contains("declined"), "{text}");
+                assert!(!text.contains("safety policy"), "{text}");
+            }
+        }
+
+        drop(write);
+        drop(reader);
+        let _ = tokio::time::timeout(Duration::from_secs(10), handle).await;
+        let audit = std::fs::read_to_string(policy.config().audit_path()).unwrap();
+        let lines: Vec<serde_json::Value> = audit
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 2, "{audit}");
+        assert_eq!(lines[0]["decision"], "confirmed");
+        assert_eq!(lines[0]["client"], "elicit-test");
+        assert_eq!(lines[0]["reason"], "unresolved_element");
+        assert_eq!(lines[1]["decision"], "denied");
+        assert_eq!(lines[1]["ok"], false);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

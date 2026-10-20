@@ -118,6 +118,7 @@ const TOOL_ALIASES: Record<string, string[]> = {
 	list_windows: ["windows", "titles"],
 	move_window: ["position window"],
 	perform_action: ["activate element", "press element", "toggle"],
+	policy_status: ["safety", "policy", "kill switch"],
 	press_key: ["keyboard", "shortcut", "hotkey"],
 	resize_window: ["window size"],
 	run_shell: ["shell", "command", "terminal"],

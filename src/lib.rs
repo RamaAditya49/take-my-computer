@@ -12,6 +12,7 @@ mod identity;
 pub mod indicator;
 mod keyboard_keymap;
 mod monitors;
+mod policy;
 mod remote_desktop;
 #[path = "screenshot.rs"]
 mod screenshot_impl;
