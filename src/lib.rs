@@ -11,6 +11,7 @@ mod gnome_extension;
 mod identity;
 pub mod indicator;
 mod keyboard_keymap;
+mod policy;
 mod remote_desktop;
 #[path = "screenshot.rs"]
 mod screenshot_impl;

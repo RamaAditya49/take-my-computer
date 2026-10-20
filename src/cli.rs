@@ -1,4 +1,6 @@
-use crate::{abs_pointer, atspi_tree, diagnostics, gnome_extension, screenshot, server, windows};
+use crate::{
+    abs_pointer, atspi_tree, diagnostics, gnome_extension, policy, screenshot, server, windows,
+};
 use anyhow::{Context, Result};
 
 pub(crate) async fn run_from_env() -> Result<()> {
@@ -127,13 +129,43 @@ pub(crate) async fn run_from_env() -> Result<()> {
             );
             Ok(())
         }
+        Some("stop") => {
+            let config = policy::PolicyConfig::from_env();
+            let path = policy::engage_kill_switch(&config)?;
+            println!(
+                "Kill switch on. Mutating tools refuse until you run 'computer-use-linux resume'. File: {}",
+                path.display()
+            );
+            Ok(())
+        }
+        Some("resume") => {
+            let config = policy::PolicyConfig::from_env();
+            if policy::release_kill_switch(&config)? {
+                println!(
+                    "Kill switch off. File removed: {}",
+                    config.stop_file().display()
+                );
+            } else {
+                println!("Kill switch was already off.");
+            }
+            Ok(())
+        }
+        Some("policy") => {
+            let status = policy::Policy::new(policy::PolicyConfig::from_env()).status(false);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&status)
+                    .context("failed to serialize policy status")?
+            );
+            Ok(())
+        }
         Some("--help") | Some("-h") => {
             print_help();
             Ok(())
         }
         Some(command) => {
             anyhow::bail!(
-                "unknown command '{command}'. Expected one of: mcp, doctor, setup, guard-accessibility, apps, state, screenshot, windows, setup-window-targeting"
+                "unknown command '{command}'. Expected one of: mcp, doctor, setup, guard-accessibility, apps, state, screenshot, windows, setup-window-targeting, stop, resume, policy"
             );
         }
         None => {
@@ -161,7 +193,7 @@ fn abs_test_report(
 fn print_help() {
     println!("guard-accessibility: explicit foreground accessibility hold-open; stop with Ctrl-C or SIGTERM before disabling accessibility.\n");
     println!(
-        "computer-use-linux\n\nUsage:\n  computer-use-linux mcp\n  computer-use-linux doctor\n  computer-use-linux setup\n  computer-use-linux setup-window-targeting\n  computer-use-linux apps\n  computer-use-linux state [APP_NAME]\n  computer-use-linux screenshot\n  computer-use-linux windows"
+        "computer-use-linux\n\nUsage:\n  computer-use-linux mcp\n  computer-use-linux doctor\n  computer-use-linux setup\n  computer-use-linux setup-window-targeting\n  computer-use-linux apps\n  computer-use-linux state [APP_NAME]\n  computer-use-linux screenshot\n  computer-use-linux windows\n  computer-use-linux stop\n  computer-use-linux resume\n  computer-use-linux policy"
     );
 }
 
