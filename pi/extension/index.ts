@@ -114,6 +114,7 @@ const TOOL_ALIASES: Record<string, string[]> = {
 	focused_window: ["active window", "focus"],
 	get_app_state: ["accessibility", "observe", "snapshot", "screen state"],
 	list_apps: ["applications", "processes"],
+	list_monitors: ["displays", "screens", "multi-monitor"],
 	list_windows: ["windows", "titles"],
 	move_window: ["position window"],
 	perform_action: ["activate element", "press element", "toggle"],

@@ -7,6 +7,11 @@ use crate::atspi_tree::{
 };
 use crate::diagnostics::{doctor_report, setup_accessibility_report, DoctorReport, SetupReport};
 use crate::gnome_extension::{setup_window_targeting_report, WindowTargetingSetupReport};
+use crate::monitors::{
+    crop_to_monitor, current_layout as current_monitor_layout, monitor_capture_rect,
+    monitor_point_to_desktop, CaptureRect, LayoutSource, MonitorCrop, MonitorLayout,
+    MonitorSelector,
+};
 use crate::remote_desktop::{
     click as portal_click, drag as portal_drag, keysyms_for_text, press_key_chord,
     press_keycode_chord, scroll as portal_scroll, start_portal_keyboard_session,
@@ -63,6 +68,8 @@ const KDE_CLIPBOARD_DBUS_TIMEOUT: Duration = Duration::from_secs(3);
 const KDE_KLIPPER_SERVICE: &str = "org.kde.klipper";
 const KDE_KLIPPER_PATH: &str = "/klipper";
 const KDE_KLIPPER_INTERFACE: &str = "org.kde.klipper.klipper";
+const MONITOR_WINDOW_TARGET_CONFLICT: &str = "monitor cannot be combined with a window target (window_id, pid, app_id, wm_class, or title). Use one of them.";
+const MONITOR_RELATIVE_CONFLICT: &str = "monitor cannot be combined with relative: true. Use monitor for monitor coordinates, or a window target with relative for window coordinates.";
 const SHELL_ENABLE_ENV: &str = "COMPUTER_USE_LINUX_ENABLE_SHELL";
 const COMPLETION_ENABLE_ENV: &str = "COMPUTER_USE_LINUX_NOTIFY_ON_COMPLETE";
 const SHELL_DEFAULT_TIMEOUT_SECS: u64 = 30;
@@ -303,6 +310,27 @@ impl ComputerUseLinux {
     }
 
     #[tool(
+        name = "list_monitors",
+        description = "List the monitors of the desktop with connector name, position, size, scale, and primary flag, sorted left to right (index 0 is the left-most). Pass the index, the connector name, or \"primary\" as monitor to screenshot, get_app_state, click, drag, and scroll.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn list_monitors(&self) -> Json<MonitorLayout> {
+        let known_size = self.desktop_size.lock().ok().and_then(|guard| *guard);
+        let layout = current_monitor_layout(known_size).await;
+        if let Some(monitor) = layout.monitors.first() {
+            if layout.source == LayoutSource::FullCapture {
+                self.cache_desktop_size(monitor.width, monitor.height);
+            }
+        }
+        Json(layout)
+    }
+
+    #[tool(
         name = "activate_window",
         output_schema = rmcp::handler::server::tool::schema_for_output::<ActivateWindowToolOutput>(),
         description = "Focus a Linux desktop window by window_id, pid, app_id, wm_class, title, or terminal selectors when the compositor permits it. Pass screenshot_after (true, \"screen\", or \"window\") or include_tree=true to return post-action observation in the same result.",
@@ -383,6 +411,14 @@ impl ComputerUseLinux {
     }
 
     async fn app_state(&self, params: GetAppStateParams) -> Result<CallToolResult, ErrorData> {
+        if params.monitor.is_some()
+            && params.include_screenshot.unwrap_or(true)
+            && params.window_target().has_target()
+        {
+            return Ok(CallToolResult::error(vec![ContentBlock::text(
+                MONITOR_WINDOW_TARGET_CONFLICT,
+            )]));
+        }
         let verbose = params.verbose.unwrap_or(false);
         let mut diagnostics = tokio::task::spawn_blocking(doctor_report)
             .await
@@ -405,8 +441,9 @@ impl ComputerUseLinux {
         let app_filter = self
             .resolve_accessibility_app_filter(&params, window_context.as_ref())
             .await;
+        let mut monitor_crop = None;
         let (screenshot, screenshot_error) = if include_screenshot {
-            let result: Result<ScreenshotCapture> = async {
+            let result: Result<(ScreenshotCapture, Option<MonitorCrop>)> = async {
                 let _pipeline = crate::screenshot_impl::screenshot_pipeline_permit().await?;
                 let raw = {
                     let _hold = self.indicator.hold_for_capture().await?;
@@ -421,7 +458,16 @@ impl ComputerUseLinux {
                 } else {
                     None
                 };
-                crate::screenshot_impl::run_image_task(move || {
+                let (raw, monitor_crop) = match params.monitor.as_ref() {
+                    Some(selector) => {
+                        let (raw, crop) = crop_to_monitor(selector, raw)
+                            .await
+                            .context("monitor screenshot failed")?;
+                        (raw, Some(crop))
+                    }
+                    None => (raw, None),
+                };
+                let capture = crate::screenshot_impl::run_image_task(move || {
                     prepare_app_state_screenshot(
                         raw,
                         crop,
@@ -429,11 +475,15 @@ impl ComputerUseLinux {
                         screenshot_options,
                     )
                 })
-                .await
+                .await?;
+                Ok((capture, monitor_crop))
             }
             .await;
             match result {
-                Ok(capture) => (Some(capture), None),
+                Ok((capture, crop)) => {
+                    monitor_crop = crop;
+                    (Some(capture), None)
+                }
                 Err(error) => (None, Some(format!("{error:#}"))),
             }
         } else {
@@ -555,7 +605,9 @@ impl ComputerUseLinux {
             window_error,
             window_permissions_hint,
             backend: "linux-atspi".to_string(),
-            screenshot: screenshot.as_ref().map(ScreenshotSummary::from),
+            screenshot: screenshot.as_ref().map(|capture| {
+                ScreenshotSummary::from(capture).with_monitor(monitor_crop.as_ref())
+            }),
             screenshot_error,
             accessibility_tree,
             accessibility_tree_raw_count,
@@ -571,7 +623,7 @@ impl ComputerUseLinux {
 
     #[tool(
         name = "screenshot",
-        description = "Capture the screen and return it as a viewable, size-bounded image. Optionally target a window (window_id/pid/wm_class/title/app_id): the window is raised to the front and the image is cropped before any resize. Returns the image plus a short caption with returned dimensions, coordinate dimensions, scale, format, quality, source, and crop bounds; callers can request jpeg/quality for compression before resizing.",
+        description = "Capture the screen and return it as a viewable, size-bounded image. Optionally target a window (window_id/pid/wm_class/title/app_id): the window is raised to the front and the image is cropped before any resize. Or pass monitor (index from list_monitors, connector name, or \"primary\") to capture one monitor at native size; monitor cannot be combined with a window target. Returns the image plus a short caption with returned dimensions, coordinate dimensions, scale, format, quality, source, crop bounds, and for a monitor the monitor name, origin_x, and origin_y (desktop x = origin_x + preview x / scale); callers can request jpeg/quality for compression before resizing.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -591,6 +643,9 @@ impl ComputerUseLinux {
     async fn capture_screenshot(&self, params: ScreenshotParams) -> Result<CallToolResult> {
         let _pipeline = crate::screenshot_impl::screenshot_pipeline_permit().await?;
         let target = params.window_target();
+        if params.monitor.is_some() && target.is_some() {
+            anyhow::bail!(MONITOR_WINDOW_TARGET_CONFLICT);
+        }
         let target_window = match target.as_ref() {
             Some(target) => Some(
                 self.resolve_screenshot_window(target, params.raise_window.unwrap_or(true))
@@ -650,6 +705,15 @@ impl ComputerUseLinux {
             }
             None => (raw_capture, false),
         };
+        let (capture, monitor_crop) = match params.monitor.as_ref() {
+            Some(selector) => {
+                let (capture, crop) = crop_to_monitor(selector, capture)
+                    .await
+                    .context("monitor screenshot failed")?;
+                (capture, Some(crop))
+            }
+            None => (capture, None),
+        };
         let options = params.screenshot_options();
         let capture = crate::screenshot_impl::run_image_task(move || {
             prepare_screenshot_payload(capture, options)
@@ -676,6 +740,11 @@ impl ComputerUseLinux {
         if let Some(note) = off_screen_note {
             caption["window_off_screen"] = serde_json::json!(true);
             caption["off_screen_note"] = serde_json::json!(note);
+        }
+        if let Some(crop) = &monitor_crop {
+            caption["monitor"] = serde_json::json!(crop.connector);
+            caption["origin_x"] = serde_json::json!(crop.origin_x);
+            caption["origin_y"] = serde_json::json!(crop.origin_y);
         }
         Ok(CallToolResult::success(vec![
             ContentBlock::image(data_url_payload(&capture.data_url), capture.mime_type),
@@ -726,7 +795,7 @@ impl ComputerUseLinux {
     #[tool(
         name = "click",
         output_schema = rmcp::handler::server::tool::schema_for_output::<ActionToolOutput>(),
-        description = "Click an element by index, semantic selector, or desktop coordinate pixels from screenshot metadata. Plain left activation prefers a native AT-SPI click/press/toggle action, avoiding toolkit coordinate scaling. Entry activate and slider jump actions are not substituted for pointer clicks. Explicit coordinates, right clicks, and multi-clicks retain pointer semantics. Pass screenshot_after (true, \"screen\", or \"window\") or include_tree=true to return post-action observation in the same result.",
+        description = "Click an element by index, semantic selector, or desktop coordinate pixels from screenshot metadata. With monitor (index from list_monitors, connector name, or \"primary\"), x/y are measured from that monitor's top-left corner and must lie inside it. Plain left activation prefers a native AT-SPI click/press/toggle action, avoiding toolkit coordinate scaling. Entry activate and slider jump actions are not substituted for pointer clicks. Explicit coordinates, right clicks, and multi-clicks retain pointer semantics. Pass screenshot_after (true, \"screen\", or \"window\") or include_tree=true to return post-action observation in the same result.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -753,6 +822,24 @@ impl ComputerUseLinux {
         // Raise the target window first (if specified) so the click lands on the
         // intended app rather than whatever is stacked on top at that pixel.
         let window_target = params.window_target();
+        if let Err(message) = monitor_input_conflict(
+            params.capture.monitor.as_ref(),
+            window_target.is_some(),
+            params.relative == Some(true),
+        ) {
+            return Json(input_failure("click", message, received));
+        }
+        if let (Some(selector), Some((x, y))) =
+            (params.capture.monitor.as_ref(), params.x.zip(params.y))
+        {
+            match self.monitor_point_to_desktop(selector, x, y).await {
+                Ok((x, y)) => {
+                    params.x = Some(x);
+                    params.y = Some(y);
+                }
+                Err(message) => return Json(input_failure("click", message, received)),
+            }
+        }
         if params.relative == Some(true) && window_target.is_none() {
             return Json(ActionOutput {
                 ok: false,
@@ -1168,7 +1255,7 @@ impl ComputerUseLinux {
     #[tool(
         name = "scroll",
         output_schema = rmcp::handler::server::tool::schema_for_output::<ActionToolOutput>(),
-        description = "Scroll an element in a direction by a number of pages. With a window target and no x/y/element_index, scrolls at the centre of the targeted window. Pass screenshot_after (true, \"screen\", or \"window\") or include_tree=true to return post-action observation in the same result.",
+        description = "Scroll an element in a direction by a number of pages. With monitor (index from list_monitors, connector name, or \"primary\"), x/y are measured from that monitor's top-left corner. With a window target and no x/y/element_index, scrolls at the centre of the targeted window. Pass screenshot_after (true, \"screen\", or \"window\") or include_tree=true to return post-action observation in the same result.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -1207,6 +1294,24 @@ impl ComputerUseLinux {
         // Raise/focus the target window first (parity with click) so wheel
         // events land on the intended app.
         let window_target = params.window_target();
+        if let Err(message) = monitor_input_conflict(
+            params.capture.monitor.as_ref(),
+            window_target.is_some(),
+            params.relative == Some(true),
+        ) {
+            return Json(input_failure("scroll", message, received));
+        }
+        if let (Some(selector), Some((x, y))) =
+            (params.capture.monitor.as_ref(), params.x.zip(params.y))
+        {
+            match self.monitor_point_to_desktop(selector, x, y).await {
+                Ok((x, y)) => {
+                    params.x = Some(x);
+                    params.y = Some(y);
+                }
+                Err(message) => return Json(input_failure("scroll", message, received)),
+            }
+        }
         if params.relative == Some(true) && window_target.is_none() {
             return Json(ActionOutput {
                 ok: false,
@@ -1532,7 +1637,7 @@ impl ComputerUseLinux {
     #[tool(
         name = "drag",
         output_schema = rmcp::handler::server::tool::schema_for_output::<ActionToolOutput>(),
-        description = "Drag from one point to another using pixel coordinates. Pass screenshot_after (true, \"screen\", or \"window\") or include_tree=true to return post-action observation in the same result.",
+        description = "Drag from one point to another using pixel coordinates. With monitor (index from list_monitors, connector name, or \"primary\"), both points are measured from that monitor's top-left corner and must lie inside it. Pass screenshot_after (true, \"screen\", or \"window\") or include_tree=true to return post-action observation in the same result.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -1549,9 +1654,24 @@ impl ComputerUseLinux {
         self.finish_action_output(output, &capture, None).await
     }
 
-    async fn dispatch_drag(&self, params: DragParams) -> Json<ActionOutput> {
+    async fn dispatch_drag(&self, mut params: DragParams) -> Json<ActionOutput> {
         let received = Some(serde_json::json!(params));
         let input_guard = Arc::clone(&self.input_operation_lock).lock_owned().await;
+        if let Some(selector) = params.capture.monitor.as_ref() {
+            let start = self
+                .monitor_point_to_desktop(selector, params.start_x, params.start_y)
+                .await;
+            let end = self
+                .monitor_point_to_desktop(selector, params.end_x, params.end_y)
+                .await;
+            match start.and_then(|start| end.map(|end| (start, end))) {
+                Ok(((start_x, start_y), (end_x, end_y))) => {
+                    (params.start_x, params.start_y) = (start_x, start_y);
+                    (params.end_x, params.end_y) = (end_x, end_y);
+                }
+                Err(message) => return Json(input_failure("drag", message, received)),
+            }
+        }
         let space = self.indicator_space();
         self.indicator
             .pointer("drag", (params.start_x, params.start_y), space)
@@ -2530,6 +2650,15 @@ struct PostActionCaptureParams {
     /// Include a fresh compacted AT-SPI accessibility tree snapshot after the action (default false). Also refreshes cached element_index values.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     include_tree: Option<bool>,
+    /// Monitor to use: an index from list_monitors, a connector name such as
+    /// "HDMI-1", or "primary". A `screenshot_after` of `true` or `"screen"`
+    /// then captures only that monitor; `"window"` ignores it. On `click`,
+    /// `drag`, and `scroll`, `x`/`y` are then measured from the top-left
+    /// corner of this monitor. Cannot be combined with a window target or
+    /// `relative: true`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "crate::monitors::post_action_monitor_schema")]
+    monitor: Option<MonitorSelector>,
 }
 
 impl PostActionCaptureParams {
@@ -2547,6 +2676,15 @@ impl PostActionCaptureParams {
             quality: self.quality,
         }
     }
+}
+
+/// Result of one post-action screenshot capture.
+struct PostActionScreenshot {
+    prepared: ScreenshotCapture,
+    cropped: bool,
+    window_title: Option<String>,
+    off_screen_note: Option<String>,
+    monitor_crop: Option<MonitorCrop>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, JsonSchema)]
@@ -2793,6 +2931,12 @@ struct GetAppStateParams {
     /// compact readiness block is returned.
     #[serde(default)]
     verbose: Option<bool>,
+    /// Capture one monitor at native size instead of the whole desktop: an
+    /// index from list_monitors, a connector name such as "HDMI-1", or
+    /// "primary". Cannot be combined with a window target.
+    #[serde(default)]
+    #[schemars(schema_with = "crate::monitors::screenshot_monitor_schema")]
+    monitor: Option<MonitorSelector>,
 }
 
 impl GetAppStateParams {
@@ -2860,6 +3004,12 @@ struct ScreenshotParams {
     #[serde(default)]
     #[schemars(range(min = 1, max = 95))]
     quality: Option<u8>,
+    /// Capture one monitor at native size instead of the whole desktop: an
+    /// index from list_monitors, a connector name such as "HDMI-1", or
+    /// "primary". Cannot be combined with a window target.
+    #[serde(default)]
+    #[schemars(schema_with = "crate::monitors::screenshot_monitor_schema")]
+    monitor: Option<MonitorSelector>,
 }
 
 impl ScreenshotParams {
@@ -2926,6 +3076,29 @@ struct ScreenshotSummary {
     /// Title of the window when cropped to a window.
     #[serde(skip_serializing_if = "Option::is_none")]
     window_title: Option<String>,
+    /// Connector name of the monitor when the screenshot shows one monitor.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    monitor: Option<String>,
+    /// Desktop x of the left edge of a monitor screenshot, before resizing.
+    /// Desktop x = origin_x + preview x / scale.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    origin_x: Option<i32>,
+    /// Desktop y of the top edge of a monitor screenshot, before resizing.
+    /// Desktop y = origin_y + preview y / scale.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    origin_y: Option<i32>,
+}
+
+impl ScreenshotSummary {
+    /// Record which monitor the screenshot shows, when it shows one.
+    fn with_monitor(mut self, crop: Option<&MonitorCrop>) -> Self {
+        if let Some(crop) = crop {
+            self.monitor = Some(crop.connector.clone());
+            self.origin_x = Some(crop.origin_x);
+            self.origin_y = Some(crop.origin_y);
+        }
+        self
+    }
 }
 
 impl From<&ScreenshotCapture> for ScreenshotSummary {
@@ -2946,6 +3119,9 @@ impl From<&ScreenshotCapture> for ScreenshotSummary {
             quality: capture.quality,
             cropped_to_window: None,
             window_title: None,
+            monitor: None,
+            origin_x: None,
+            origin_y: None,
         }
     }
 }
@@ -3661,7 +3837,7 @@ impl ComputerUseLinux {
 
         if let Some(scope) = screenshot_scope {
             let options = capture.screenshot_options();
-            let result: Result<(ScreenshotCapture, bool, Option<String>, Option<String>)> = async {
+            let result: Result<PostActionScreenshot> = async {
                 let _pipeline = crate::screenshot_impl::screenshot_pipeline_permit().await?;
                 let crop_window = match scope {
                     ScreenshotAfterScope::Screen => None,
@@ -3725,23 +3901,41 @@ impl ComputerUseLinux {
                     }
                     None => (raw_capture, false),
                 };
+                // A window crop already narrows the capture, so the monitor
+                // applies to full-desktop captures only.
+                let (raw_for_payload, monitor_crop) = match (scope, capture.monitor.as_ref()) {
+                    (ScreenshotAfterScope::Screen, Some(selector)) => {
+                        let (raw, crop) = crop_to_monitor(selector, raw_for_payload)
+                            .await
+                            .context("post-action monitor screenshot failed")?;
+                        (raw, Some(crop))
+                    }
+                    _ => (raw_for_payload, None),
+                };
                 let prepared = crate::screenshot_impl::run_image_task(move || {
                     prepare_screenshot_payload(raw_for_payload, options)
                 })
                 .await
                 .context("post-action screenshot resize failed")?;
-                Ok((prepared, cropped, window_label, off_screen_note))
+                Ok(PostActionScreenshot {
+                    prepared,
+                    cropped,
+                    window_title: window_label,
+                    off_screen_note,
+                    monitor_crop,
+                })
             }
             .await;
 
             match result {
-                Ok((prepared, cropped, window_title, off_screen_note)) => {
-                    let mut summary = ScreenshotSummary::from(&prepared);
-                    summary.cropped_to_window = Some(cropped);
-                    summary.window_title = window_title;
+                Ok(shot) => {
+                    let mut summary = ScreenshotSummary::from(&shot.prepared)
+                        .with_monitor(shot.monitor_crop.as_ref());
+                    summary.cropped_to_window = Some(shot.cropped);
+                    summary.window_title = shot.window_title;
                     observation.screenshot = Some(summary);
-                    screenshot_capture = Some(prepared);
-                    if let Some(note) = off_screen_note {
+                    screenshot_capture = Some(shot.prepared);
+                    if let Some(note) = shot.off_screen_note {
                         notes.push(note);
                     }
                 }
@@ -4147,6 +4341,35 @@ impl ComputerUseLinux {
                 focus.focused_window.as_ref().map(|window| window.window_id)
             ))
         }
+    }
+
+    /// Capture-pixel rectangle of a monitor, from the cached desktop size.
+    async fn monitor_input_rect(
+        &self,
+        selector: &MonitorSelector,
+    ) -> std::result::Result<(String, CaptureRect), String> {
+        let (_, _, width, height) = self.capture_space_rect().await.ok_or_else(|| {
+            "The screen size is unknown, so the monitor cannot be located. Take a screenshot first."
+                .to_string()
+        })?;
+        let (width, height) = (width as u32, height as u32);
+        let layout = current_monitor_layout(Some((width, height))).await;
+        let monitor = selector.resolve(&layout.monitors)?;
+        let rect = monitor_capture_rect(monitor, &layout.monitors, width, height)
+            .map_err(|error| format!("{error:#}. Take a new screenshot, then try again."))?;
+        Ok((monitor.connector.clone(), rect))
+    }
+
+    /// Turn a point measured from a monitor's top-left corner into a desktop
+    /// point. Rejects a point outside the monitor.
+    async fn monitor_point_to_desktop(
+        &self,
+        selector: &MonitorSelector,
+        x: i32,
+        y: i32,
+    ) -> std::result::Result<(i32, i32), String> {
+        let (connector, rect) = self.monitor_input_rect(selector).await?;
+        monitor_point_to_desktop(&connector, rect, x, y)
     }
 
     fn cache_desktop_size(&self, width: u32, height: u32) {
@@ -5615,6 +5838,40 @@ fn portal_action_error(
         ),
         received,
     }
+}
+
+/// A coordinate input that failed before any input was sent.
+fn input_failure(
+    action: &str,
+    message: String,
+    received: Option<serde_json::Value>,
+) -> ActionOutput {
+    ActionOutput {
+        ok: false,
+        implemented: true,
+        action: action.to_string(),
+        message,
+        received,
+    }
+}
+
+/// `monitor` sets the origin of `x`/`y`, so it cannot also name a window or
+/// ask for window-relative coordinates.
+fn monitor_input_conflict(
+    monitor: Option<&MonitorSelector>,
+    has_window_target: bool,
+    relative: bool,
+) -> std::result::Result<(), String> {
+    if monitor.is_none() {
+        return Ok(());
+    }
+    if has_window_target {
+        return Err(MONITOR_WINDOW_TARGET_CONFLICT.to_string());
+    }
+    if relative {
+        return Err(MONITOR_RELATIVE_CONFLICT.to_string());
+    }
+    Ok(())
 }
 
 fn portal_coordinate_error(action: &str, received: Option<serde_json::Value>) -> ActionOutput {
@@ -10849,6 +11106,264 @@ mod post_action_capture_tests {
         }
     }
 
+    fn tool_json(name: &str) -> serde_json::Value {
+        let tools = ComputerUseLinux::default().mcp_tool_router().list_all();
+        let tool = tools
+            .iter()
+            .find(|tool| tool.name == name)
+            .unwrap_or_else(|| panic!("missing tool {name}"));
+        serde_json::to_value(tool).unwrap()
+    }
+
+    #[test]
+    fn list_monitors_is_a_read_only_tool_with_a_typed_output() {
+        let value = tool_json("list_monitors");
+        assert_eq!(value["annotations"]["readOnlyHint"], true);
+        assert_eq!(value["annotations"]["destructiveHint"], false);
+        assert_eq!(value["annotations"]["idempotentHint"], true);
+        assert_eq!(value["annotations"]["openWorldHint"], true);
+        assert!(value["description"]
+            .as_str()
+            .unwrap()
+            .contains("\"primary\""));
+        let output = value["outputSchema"]["properties"]
+            .as_object()
+            .expect("list_monitors output schema has properties");
+        for key in ["source", "monitors", "error", "note"] {
+            assert!(output.contains_key(key), "missing output property {key}");
+        }
+    }
+
+    #[test]
+    fn monitor_parameter_is_exposed_on_capture_and_pointer_tools() {
+        for name in [
+            "screenshot",
+            "get_app_state",
+            "click",
+            "drag",
+            "scroll",
+            "press_key",
+            "type_text",
+            "activate_window",
+            "perform_action",
+            "set_value",
+            "move_window",
+            "resize_window",
+        ] {
+            let value = tool_json(name);
+            let monitor = &value["inputSchema"]["properties"]["monitor"];
+            assert!(
+                monitor.is_object(),
+                "{name} is missing the monitor property"
+            );
+            let kinds: Vec<_> = monitor["anyOf"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{name} monitor has no anyOf: {monitor}"))
+                .iter()
+                .filter_map(|branch| branch["type"].as_str())
+                .collect();
+            assert!(
+                kinds.contains(&"integer") && kinds.contains(&"string"),
+                "{name} monitor must accept an index or a name: {monitor}"
+            );
+            let required = value["inputSchema"]["required"].as_array();
+            assert!(
+                required.is_none_or(|required| !required.iter().any(|key| key == "monitor")),
+                "{name} must not require monitor"
+            );
+        }
+    }
+
+    #[test]
+    fn monitor_parameter_reads_an_index_or_a_name_next_to_post_action_fields() {
+        let params: ClickParams = serde_json::from_value(serde_json::json!({
+            "x": 10,
+            "y": 20,
+            "monitor": 1,
+            "screenshot_after": "screen"
+        }))
+        .unwrap();
+        assert_eq!(params.capture.monitor, Some(MonitorSelector::Index(1)));
+        assert_eq!(params.x, Some(10));
+
+        let params: DragParams = serde_json::from_value(serde_json::json!({
+            "start_x": 1, "start_y": 2, "end_x": 3, "end_y": 4, "monitor": "HDMI-2"
+        }))
+        .unwrap();
+        assert_eq!(
+            params.capture.monitor,
+            Some(MonitorSelector::Name("HDMI-2".to_string()))
+        );
+
+        let params: ScrollParams = serde_json::from_value(serde_json::json!({
+            "direction": "down", "monitor": null
+        }))
+        .unwrap();
+        assert_eq!(params.capture.monitor, None);
+
+        let params: ScreenshotParams =
+            serde_json::from_value(serde_json::json!({"monitor": "primary"})).unwrap();
+        assert_eq!(
+            params.monitor,
+            Some(MonitorSelector::Name("primary".to_string()))
+        );
+        let params: GetAppStateParams =
+            serde_json::from_value(serde_json::json!({"monitor": "2"})).unwrap();
+        assert_eq!(params.monitor, Some(MonitorSelector::Index(2)));
+
+        let error = serde_json::from_value::<ClickParams>(serde_json::json!({"monitor": -1}))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("negative"), "{error}");
+        assert!(serde_json::from_value::<ScreenshotParams>(
+            serde_json::json!({"monitor": ["HDMI-1"]})
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn monitor_conflicts_with_window_targets_and_relative_coordinates() {
+        let monitor = MonitorSelector::Index(0);
+        assert_eq!(monitor_input_conflict(None, true, true), Ok(()));
+        assert_eq!(monitor_input_conflict(Some(&monitor), false, false), Ok(()));
+        assert_eq!(
+            monitor_input_conflict(Some(&monitor), true, false),
+            Err(MONITOR_WINDOW_TARGET_CONFLICT.to_string())
+        );
+        assert_eq!(
+            monitor_input_conflict(Some(&monitor), false, true),
+            Err(MONITOR_RELATIVE_CONFLICT.to_string())
+        );
+        assert!(MONITOR_WINDOW_TARGET_CONFLICT.contains("window target"));
+        assert!(MONITOR_RELATIVE_CONFLICT.contains("relative: true"));
+    }
+
+    #[tokio::test]
+    async fn pointer_tools_reject_monitor_with_a_window_target_or_relative_coordinates() {
+        let server = ComputerUseLinux::default();
+        for (extra, expected) in [
+            (serde_json::json!({"window_id": 7}), "window target"),
+            (serde_json::json!({"pid": 7}), "window target"),
+            (serde_json::json!({"relative": true}), "relative: true"),
+        ] {
+            let mut click = serde_json::json!({"x": 1, "y": 2, "monitor": "primary"});
+            let mut scroll = serde_json::json!({"direction": "down", "x": 1, "y": 2, "monitor": 0});
+            for (key, value) in extra.as_object().unwrap() {
+                click[key] = value.clone();
+                scroll[key] = value.clone();
+            }
+            let result = server
+                .dispatch_click(serde_json::from_value(click).unwrap())
+                .await
+                .0;
+            assert!(!result.ok, "{}", result.message);
+            assert!(result.message.contains(expected), "{}", result.message);
+            let result = server
+                .dispatch_scroll(serde_json::from_value(scroll).unwrap())
+                .await
+                .0;
+            assert!(!result.ok, "{}", result.message);
+            assert!(result.message.contains(expected), "{}", result.message);
+        }
+    }
+
+    #[tokio::test]
+    async fn pointer_tools_reject_an_unknown_monitor_before_sending_input() {
+        let server = ComputerUseLinux::default();
+        server.cache_desktop_size(1920, 1080);
+        let click = serde_json::json!({"x": 1, "y": 2, "monitor": "NOPE-9"});
+        let result = server
+            .dispatch_click(serde_json::from_value(click).unwrap())
+            .await
+            .0;
+        assert!(!result.ok);
+        assert!(
+            result.message.contains("was not found"),
+            "{}",
+            result.message
+        );
+        assert!(result.message.contains("NOPE-9"), "{}", result.message);
+
+        let scroll = serde_json::json!({"direction": "up", "x": 1, "y": 2, "monitor": "NOPE-9"});
+        let result = server
+            .dispatch_scroll(serde_json::from_value(scroll).unwrap())
+            .await
+            .0;
+        assert!(!result.ok);
+        assert!(
+            result.message.contains("was not found"),
+            "{}",
+            result.message
+        );
+
+        let drag = serde_json::json!({
+            "start_x": 1, "start_y": 2, "end_x": 3, "end_y": 4, "monitor": "NOPE-9"
+        });
+        let result = server
+            .dispatch_drag(serde_json::from_value(drag).unwrap())
+            .await
+            .0;
+        assert!(!result.ok);
+        assert!(
+            result.message.contains("was not found"),
+            "{}",
+            result.message
+        );
+    }
+
+    #[tokio::test]
+    async fn screenshot_tools_reject_monitor_with_a_window_target() {
+        let server = ComputerUseLinux::default();
+        let params: ScreenshotParams =
+            serde_json::from_value(serde_json::json!({"monitor": 0, "window_id": 3})).unwrap();
+        let error = server.capture_screenshot(params).await.unwrap_err();
+        assert!(format!("{error:#}").contains("window target"), "{error:#}");
+
+        let params: GetAppStateParams =
+            serde_json::from_value(serde_json::json!({"monitor": 0, "pid": 3})).unwrap();
+        let result = server.app_state(params).await.unwrap();
+        assert_eq!(result.is_error, Some(true));
+        let text = serde_json::to_string(&result.content).unwrap();
+        assert!(text.contains("window target"), "{text}");
+    }
+
+    #[test]
+    fn screenshot_summary_reports_the_monitor_origin_only_for_monitor_captures() {
+        let capture = ScreenshotCapture {
+            mime_type: "image/png".to_string(),
+            data_url: "data:image/png;base64,AAAA".to_string(),
+            source: "test".to_string(),
+            width: 1920,
+            height: 1080,
+            coordinate_width: 1920,
+            coordinate_height: 1080,
+            scale: 1.0,
+            resized: false,
+            bytes: 3,
+            original_bytes: 3,
+            max_bytes: 2_097_152,
+            format: ScreenshotOutputFormat::Png,
+            quality: None,
+        };
+        let plain = serde_json::to_value(ScreenshotSummary::from(&capture)).unwrap();
+        for key in ["monitor", "origin_x", "origin_y"] {
+            assert!(plain.get(key).is_none(), "unexpected {key}: {plain}");
+        }
+
+        let crop = MonitorCrop {
+            connector: "HDMI-2".to_string(),
+            origin_x: 1920,
+            origin_y: 0,
+        };
+        let summary =
+            serde_json::to_value(ScreenshotSummary::from(&capture).with_monitor(Some(&crop)))
+                .unwrap();
+        assert_eq!(summary["monitor"], "HDMI-2");
+        assert_eq!(summary["origin_x"], 1920);
+        assert_eq!(summary["origin_y"], 0);
+        assert_eq!(summary["width"], 1920);
+    }
+
     #[test]
     fn post_action_capture_executes_after_action_and_preserves_action_ok_on_capture_failure() {
         let dir = std::env::temp_dir().join(format!(
@@ -11044,6 +11559,66 @@ exit 1
             events.is_empty(),
             "failed action must not run xdotool or gnome-screenshot: {events}"
         );
+
+        // 3b. Without a compositor layout the whole screen is one monitor. A
+        // monitor click lands at the monitor origin plus x/y, and a monitor
+        // post-action screenshot reports that monitor and its origin.
+        std::fs::write(&log_path, "").unwrap();
+        let monitor_click: ClickParams = serde_json::from_value(serde_json::json!({
+            "x": 10,
+            "y": 20,
+            "monitor": "primary",
+            "screenshot_after": true
+        }))
+        .unwrap();
+        let result = server.click(Parameters(monitor_click)).await.unwrap();
+        let structured = result.structured_content.expect("structured content");
+        assert_eq!(structured["ok"], serde_json::json!(true));
+        assert_eq!(structured["screenshot"]["monitor"], "screen");
+        assert_eq!(structured["screenshot"]["origin_x"], 0);
+        assert_eq!(structured["screenshot"]["origin_y"], 0);
+        assert_eq!(structured["screenshot"]["width"], serde_json::json!(64));
+        let outside: ClickParams = serde_json::from_value(serde_json::json!({
+            "x": 64,
+            "y": 0,
+            "monitor": 0,
+            "screenshot_after": true
+        }))
+        .unwrap();
+        let result = server.click(Parameters(outside)).await.unwrap();
+        let structured = result.structured_content.expect("structured content");
+        assert_eq!(structured["ok"], serde_json::json!(false));
+        assert!(structured["message"]
+            .as_str()
+            .unwrap()
+            .contains("outside monitor screen (64x48)"));
+        assert!(structured.get("screenshot").is_none());
+        let missing: ClickParams = serde_json::from_value(serde_json::json!({
+            "x": 1,
+            "y": 1,
+            "monitor": 5
+        }))
+        .unwrap();
+        let result = server.click(Parameters(missing)).await.unwrap();
+        let structured = result.structured_content.expect("structured content");
+        assert_eq!(structured["ok"], serde_json::json!(false));
+        assert!(structured["message"]
+            .as_str()
+            .unwrap()
+            .contains("Available monitors: 0 screen (primary)"));
+        let window_scope: PostActionCaptureParams = serde_json::from_value(serde_json::json!({
+            "screenshot_after": "screen",
+            "monitor": "NOPE-9"
+        }))
+        .unwrap();
+        let (observation, screenshot, notes) = server
+            .capture_post_action_observation(&window_scope, None, None)
+            .await;
+        assert!(screenshot.is_none());
+        assert!(observation.screenshot.is_none());
+        assert!(notes
+            .join(" ")
+            .contains("Post-action screenshot failed: post-action monitor screenshot failed"));
 
         // 4. activate_window preserves post-action observation notes in message.
         std::env::set_var("CUL_POST_ACTION_FAIL_SCREENSHOT", "1");

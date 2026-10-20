@@ -8,8 +8,8 @@ export interface GeneratedMcpToolDefinition {
 }
 
 export const GENERATED_SERVER_VERSION = "0.7.20";
-export const GENERATED_TOOL_CATALOG_HASH = "b9a6ef2736cd165b97982ec6ccf1e6cfb47712f0d4a8ae778ecac47e211b15ec";
-export const GENERATED_SHELL_TOOL_CATALOG_HASH = "113fc01364844db492475ec7ad00f1d03fe8e2d7acedc8a0aa3b48d245f99105";
+export const GENERATED_TOOL_CATALOG_HASH = "ec9cba2f20fc279133ffad850ac6c3a41079c5c70ca195bbedc2eaf86b5f53ac";
+export const GENERATED_SHELL_TOOL_CATALOG_HASH = "afa36adec575d5ab0b968b712a780c942d97035049e4d6322905c9bb8616be79";
 export const GENERATED_MCP_TOOLS =
 [
   {
@@ -80,6 +80,21 @@ export const GENERATED_MCP_TOOLS =
             "integer",
             "null"
           ]
+        },
+        "monitor": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Monitor to use: an index from list_monitors, a connector name such as\n\"HDMI-1\", or \"primary\". A `screenshot_after` of `true` or `\"screen\"`\nthen captures only that monitor; `\"window\"` ignores it. On `click`,\n`drag`, and `scroll`, `x`/`y` are then measured from the top-left\ncorner of this monitor. Cannot be combined with a window target or\n`relative: true`."
         },
         "pid": {
           "default": null,
@@ -187,7 +202,7 @@ export const GENERATED_MCP_TOOLS =
       "openWorldHint": true,
       "readOnlyHint": false
     },
-    "description": "Click an element by index, semantic selector, or desktop coordinate pixels from screenshot metadata. Plain left activation prefers a native AT-SPI click/press/toggle action, avoiding toolkit coordinate scaling. Entry activate and slider jump actions are not substituted for pointer clicks. Explicit coordinates, right clicks, and multi-clicks retain pointer semantics. Pass screenshot_after (true, \"screen\", or \"window\") or include_tree=true to return post-action observation in the same result.",
+    "description": "Click an element by index, semantic selector, or desktop coordinate pixels from screenshot metadata. With monitor (index from list_monitors, connector name, or \"primary\"), x/y are measured from that monitor's top-left corner and must lie inside it. Plain left activation prefers a native AT-SPI click/press/toggle action, avoiding toolkit coordinate scaling. Entry activate and slider jump actions are not substituted for pointer clicks. Explicit coordinates, right clicks, and multi-clicks retain pointer semantics. Pass screenshot_after (true, \"screen\", or \"window\") or include_tree=true to return post-action observation in the same result.",
     "inputSchema": {
       "$defs": {
         "ScreenshotOutputFormat": {
@@ -271,6 +286,21 @@ export const GENERATED_MCP_TOOLS =
             "integer",
             "null"
           ]
+        },
+        "monitor": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Monitor to use: an index from list_monitors, a connector name such as\n\"HDMI-1\", or \"primary\". A `screenshot_after` of `true` or `\"screen\"`\nthen captures only that monitor; `\"window\"` ignores it. On `click`,\n`drag`, and `scroll`, `x`/`y` are then measured from the top-left\ncorner of this monitor. Cannot be combined with a window target or\n`relative: true`."
         },
         "name": {
           "default": null,
@@ -415,7 +445,7 @@ export const GENERATED_MCP_TOOLS =
       "openWorldHint": true,
       "readOnlyHint": false
     },
-    "description": "Drag from one point to another using pixel coordinates. Pass screenshot_after (true, \"screen\", or \"window\") or include_tree=true to return post-action observation in the same result.",
+    "description": "Drag from one point to another using pixel coordinates. With monitor (index from list_monitors, connector name, or \"primary\"), both points are measured from that monitor's top-left corner and must lie inside it. Pass screenshot_after (true, \"screen\", or \"window\") or include_tree=true to return post-action observation in the same result.",
     "inputSchema": {
       "$defs": {
         "ScreenshotOutputFormat": {
@@ -477,6 +507,21 @@ export const GENERATED_MCP_TOOLS =
             "integer",
             "null"
           ]
+        },
+        "monitor": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Monitor to use: an index from list_monitors, a connector name such as\n\"HDMI-1\", or \"primary\". A `screenshot_after` of `true` or `\"screen\"`\nthen captures only that monitor; `\"window\"` ignores it. On `click`,\n`drag`, and `scroll`, `x`/`y` are then measured from the top-left\ncorner of this monitor. Cannot be combined with a window target or\n`relative: true`."
         },
         "quality": {
           "description": "JPEG quality from 1 to 95 (default 80) for post-action screenshots. Ignored for png.",
@@ -647,6 +692,22 @@ export const GENERATED_MCP_TOOLS =
             "null"
           ]
         },
+        "monitor": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Capture one monitor at native size instead of the whole desktop: an\nindex from list_monitors, a connector name such as \"HDMI-1\", or\n\"primary\". Cannot be combined with a window target."
+        },
         "pid": {
           "default": null,
           "description": "Process id. Also scopes the accessibility tree to that process when it\nexposes AT-SPI.",
@@ -767,6 +828,20 @@ export const GENERATED_MCP_TOOLS =
       "openWorldHint": true,
       "readOnlyHint": true
     },
+    "description": "List the monitors of the desktop with connector name, position, size, scale, and primary flag, sorted left to right (index 0 is the left-most). Pass the index, the connector name, or \"primary\" as monitor to screenshot, get_app_state, click, drag, and scroll.",
+    "inputSchema": {
+      "properties": {},
+      "type": "object"
+    },
+    "name": "list_monitors"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": true,
+      "readOnlyHint": true
+    },
     "description": "List compositor windows with title, app id, class, focus state, client type, and known bounds.",
     "inputSchema": {
       "properties": {},
@@ -842,6 +917,21 @@ export const GENERATED_MCP_TOOLS =
             "integer",
             "null"
           ]
+        },
+        "monitor": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Monitor to use: an index from list_monitors, a connector name such as\n\"HDMI-1\", or \"primary\". A `screenshot_after` of `true` or `\"screen\"`\nthen captures only that monitor; `\"window\"` ignores it. On `click`,\n`drag`, and `scroll`, `x`/`y` are then measured from the top-left\ncorner of this monitor. Cannot be combined with a window target or\n`relative: true`."
         },
         "pid": {
           "default": null,
@@ -1040,6 +1130,21 @@ export const GENERATED_MCP_TOOLS =
             "null"
           ]
         },
+        "monitor": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Monitor to use: an index from list_monitors, a connector name such as\n\"HDMI-1\", or \"primary\". A `screenshot_after` of `true` or `\"screen\"`\nthen captures only that monitor; `\"window\"` ignores it. On `click`,\n`drag`, and `scroll`, `x`/`y` are then measured from the top-left\ncorner of this monitor. Cannot be combined with a window target or\n`relative: true`."
+        },
         "name": {
           "default": null,
           "type": [
@@ -1179,6 +1284,21 @@ export const GENERATED_MCP_TOOLS =
             "integer",
             "null"
           ]
+        },
+        "monitor": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Monitor to use: an index from list_monitors, a connector name such as\n\"HDMI-1\", or \"primary\". A `screenshot_after` of `true` or `\"screen\"`\nthen captures only that monitor; `\"window\"` ignores it. On `click`,\n`drag`, and `scroll`, `x`/`y` are then measured from the top-left\ncorner of this monitor. Cannot be combined with a window target or\n`relative: true`."
         },
         "pid": {
           "default": null,
@@ -1356,6 +1476,21 @@ export const GENERATED_MCP_TOOLS =
             "null"
           ]
         },
+        "monitor": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Monitor to use: an index from list_monitors, a connector name such as\n\"HDMI-1\", or \"primary\". A `screenshot_after` of `true` or `\"screen\"`\nthen captures only that monitor; `\"window\"` ignores it. On `click`,\n`drag`, and `scroll`, `x`/`y` are then measured from the top-left\ncorner of this monitor. Cannot be combined with a window target or\n`relative: true`."
+        },
         "pid": {
           "default": null,
           "minimum": 0,
@@ -1471,7 +1606,7 @@ export const GENERATED_MCP_TOOLS =
       "openWorldHint": true,
       "readOnlyHint": false
     },
-    "description": "Capture the screen and return it as a viewable, size-bounded image. Optionally target a window (window_id/pid/wm_class/title/app_id): the window is raised to the front and the image is cropped before any resize. Returns the image plus a short caption with returned dimensions, coordinate dimensions, scale, format, quality, source, and crop bounds; callers can request jpeg/quality for compression before resizing.",
+    "description": "Capture the screen and return it as a viewable, size-bounded image. Optionally target a window (window_id/pid/wm_class/title/app_id): the window is raised to the front and the image is cropped before any resize. Or pass monitor (index from list_monitors, connector name, or \"primary\") to capture one monitor at native size; monitor cannot be combined with a window target. Returns the image plus a short caption with returned dimensions, coordinate dimensions, scale, format, quality, source, crop bounds, and for a monitor the monitor name, origin_x, and origin_y (desktop x = origin_x + preview x / scale); callers can request jpeg/quality for compression before resizing.",
     "inputSchema": {
       "$defs": {
         "ScreenshotOutputFormat": {
@@ -1537,6 +1672,22 @@ export const GENERATED_MCP_TOOLS =
             "integer",
             "null"
           ]
+        },
+        "monitor": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Capture one monitor at native size instead of the whole desktop: an\nindex from list_monitors, a connector name such as \"HDMI-1\", or\n\"primary\". Cannot be combined with a window target."
         },
         "pid": {
           "default": null,
@@ -1607,7 +1758,7 @@ export const GENERATED_MCP_TOOLS =
       "openWorldHint": true,
       "readOnlyHint": false
     },
-    "description": "Scroll an element in a direction by a number of pages. With a window target and no x/y/element_index, scrolls at the centre of the targeted window. Pass screenshot_after (true, \"screen\", or \"window\") or include_tree=true to return post-action observation in the same result.",
+    "description": "Scroll an element in a direction by a number of pages. With monitor (index from list_monitors, connector name, or \"primary\"), x/y are measured from that monitor's top-left corner. With a window target and no x/y/element_index, scrolls at the centre of the targeted window. Pass screenshot_after (true, \"screen\", or \"window\") or include_tree=true to return post-action observation in the same result.",
     "inputSchema": {
       "$defs": {
         "ScreenshotOutputFormat": {
@@ -1679,6 +1830,21 @@ export const GENERATED_MCP_TOOLS =
             "integer",
             "null"
           ]
+        },
+        "monitor": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Monitor to use: an index from list_monitors, a connector name such as\n\"HDMI-1\", or \"primary\". A `screenshot_after` of `true` or `\"screen\"`\nthen captures only that monitor; `\"window\"` ignores it. On `click`,\n`drag`, and `scroll`, `x`/`y` are then measured from the top-left\ncorner of this monitor. Cannot be combined with a window target or\n`relative: true`."
         },
         "pages": {
           "default": null,
@@ -1864,6 +2030,21 @@ export const GENERATED_MCP_TOOLS =
             "null"
           ]
         },
+        "monitor": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Monitor to use: an index from list_monitors, a connector name such as\n\"HDMI-1\", or \"primary\". A `screenshot_after` of `true` or `\"screen\"`\nthen captures only that monitor; `\"window\"` ignores it. On `click`,\n`drag`, and `scroll`, `x`/`y` are then measured from the top-left\ncorner of this monitor. Cannot be combined with a window target or\n`relative: true`."
+        },
         "name": {
           "default": null,
           "type": [
@@ -2034,6 +2215,21 @@ export const GENERATED_MCP_TOOLS =
             "integer",
             "null"
           ]
+        },
+        "monitor": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Monitor to use: an index from list_monitors, a connector name such as\n\"HDMI-1\", or \"primary\". A `screenshot_after` of `true` or `\"screen\"`\nthen captures only that monitor; `\"window\"` ignores it. On `click`,\n`drag`, and `scroll`, `x`/`y` are then measured from the top-left\ncorner of this monitor. Cannot be combined with a window target or\n`relative: true`."
         },
         "pid": {
           "default": null,
