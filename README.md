@@ -146,6 +146,17 @@ When post-action screenshot capture succeeds, the image is returned as the first
 
 Screenshot payloads are size-bounded by default before they are returned to the MCP host: max 1920 px width/height and 2 MiB image bytes, with hard caps even when callers request more. Agents that need more detail can pass `max_width`, `max_height`, `max_bytes`, `scale`, `format: "jpeg"`, or `quality`, preferably with a window target or crop. PNG remains the default; JPEG lets callers trade lossless pixels for a smaller payload before the byte cap forces further resizing. Returned screenshot metadata includes `coordinate_width`, `coordinate_height`, `scale`, `format`, and `quality` so callers can convert from a downscaled preview to desktop coordinate pixels.
 
+### Multi-monitor (take-my-computer)
+
+`list_monitors` (CLI: `computer-use-linux monitors`) lists each monitor with `index`, `connector`, `x`, `y`, `width`, `height`, `scale`, and `primary`, sorted left to right. On GNOME the layout comes from the compositor. Elsewhere the whole screen counts as one monitor.
+
+Pass `monitor` (an index, a connector name such as `"HDMI-2"`, or `"primary"`) to:
+
+- `screenshot`, `get_app_state`, and `screenshot_after` (CLI: `screenshot --monitor <M>`): capture one monitor at native size. The metadata adds `monitor`, `origin_x`, and `origin_y`. Desktop x = `origin_x` + preview x / `scale`.
+- `click`, `drag`, and `scroll`: `x` and `y` are measured from the top-left corner of that monitor. A point outside the monitor is rejected.
+
+`monitor` cannot be combined with a window target, and not with `relative: true`.
+
 ### Input & semantic targeting contracts
 
 For a plain left `click` by element index or selector, a recognized native

@@ -1,4 +1,6 @@
-use crate::{abs_pointer, atspi_tree, diagnostics, gnome_extension, screenshot, server, windows};
+use crate::{
+    abs_pointer, atspi_tree, diagnostics, gnome_extension, monitors, screenshot, server, windows,
+};
 use anyhow::{Context, Result};
 
 pub(crate) async fn run_from_env() -> Result<()> {
@@ -67,27 +69,32 @@ pub(crate) async fn run_from_env() -> Result<()> {
             println!("{}", abs_test_report(landing, (cap.width, cap.height)));
             Ok(())
         }
-        Some("screenshot") => {
-            let capture = screenshot::capture_screenshot().await?;
+        Some("monitors") => {
+            let layout = monitors::current_layout(None).await;
             println!(
                 "{}",
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "mime_type": capture.mime_type,
-                    "source": capture.source,
-                    "width": capture.width,
-                    "height": capture.height,
-                    "coordinate_width": capture.coordinate_width,
-                    "coordinate_height": capture.coordinate_height,
-                    "scale": capture.scale,
-                    "resized": capture.resized,
-                    "bytes": capture.bytes,
-                    "original_bytes": capture.original_bytes,
-                    "max_bytes": capture.max_bytes,
-                    "format": capture.format,
-                    "quality": capture.quality,
-                    "data_url_length": capture.data_url.len()
-                }))
-                .context("failed to serialize screenshot report")?
+                serde_json::to_string_pretty(&layout)
+                    .context("failed to serialize monitor layout")?
+            );
+            Ok(())
+        }
+        Some("screenshot") => {
+            let monitor = screenshot_monitor_arg(std::env::args().skip(2))?;
+            let (capture, crop) = match monitor.as_ref() {
+                Some(selector) => {
+                    let (capture, crop) = monitors::capture_monitor_screenshot(
+                        selector,
+                        screenshot::ScreenshotPayloadOptions::default(),
+                    )
+                    .await?;
+                    (capture, Some(crop))
+                }
+                None => (screenshot::capture_screenshot().await?, None),
+            };
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&screenshot_report(&capture, crop.as_ref()))
+                    .context("failed to serialize screenshot report")?
             );
             Ok(())
         }
@@ -133,7 +140,7 @@ pub(crate) async fn run_from_env() -> Result<()> {
         }
         Some(command) => {
             anyhow::bail!(
-                "unknown command '{command}'. Expected one of: mcp, doctor, setup, guard-accessibility, apps, state, screenshot, windows, setup-window-targeting"
+                "unknown command '{command}'. Expected one of: mcp, doctor, setup, guard-accessibility, apps, state, screenshot, monitors, windows, setup-window-targeting"
             );
         }
         None => {
@@ -141,6 +148,58 @@ pub(crate) async fn run_from_env() -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// The `--monitor` value of `screenshot`, when given.
+fn screenshot_monitor_arg(
+    mut args: impl Iterator<Item = String>,
+) -> Result<Option<monitors::MonitorSelector>> {
+    let mut monitor = None;
+    while let Some(arg) = args.next() {
+        let value = if arg == "--monitor" {
+            args.next().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--monitor needs a value: an index, a connector name, or \"primary\""
+                )
+            })?
+        } else if let Some(value) = arg.strip_prefix("--monitor=") {
+            value.to_string()
+        } else {
+            anyhow::bail!(
+                "unknown screenshot option '{arg}'. Expected: --monitor <INDEX|CONNECTOR|primary>"
+            );
+        };
+        monitor = Some(monitors::MonitorSelector::from_text(&value).map_err(anyhow::Error::msg)?);
+    }
+    Ok(monitor)
+}
+
+fn screenshot_report(
+    capture: &screenshot::ScreenshotCapture,
+    monitor: Option<&monitors::MonitorCrop>,
+) -> serde_json::Value {
+    let mut report = serde_json::json!({
+        "mime_type": capture.mime_type,
+        "source": capture.source,
+        "width": capture.width,
+        "height": capture.height,
+        "coordinate_width": capture.coordinate_width,
+        "coordinate_height": capture.coordinate_height,
+        "scale": capture.scale,
+        "resized": capture.resized,
+        "bytes": capture.bytes,
+        "original_bytes": capture.original_bytes,
+        "max_bytes": capture.max_bytes,
+        "format": capture.format,
+        "quality": capture.quality,
+        "data_url_length": capture.data_url.len()
+    });
+    if let Some(crop) = monitor {
+        report["monitor"] = serde_json::json!(crop.connector);
+        report["origin_x"] = serde_json::json!(crop.origin_x);
+        report["origin_y"] = serde_json::json!(crop.origin_y);
+    }
+    report
 }
 
 fn abs_test_report(
@@ -161,13 +220,93 @@ fn abs_test_report(
 fn print_help() {
     println!("guard-accessibility: explicit foreground accessibility hold-open; stop with Ctrl-C or SIGTERM before disabling accessibility.\n");
     println!(
-        "computer-use-linux\n\nUsage:\n  computer-use-linux mcp\n  computer-use-linux doctor\n  computer-use-linux setup\n  computer-use-linux setup-window-targeting\n  computer-use-linux apps\n  computer-use-linux state [APP_NAME]\n  computer-use-linux screenshot\n  computer-use-linux windows"
+        "computer-use-linux\n\nUsage:\n  computer-use-linux mcp\n  computer-use-linux doctor\n  computer-use-linux setup\n  computer-use-linux setup-window-targeting\n  computer-use-linux apps\n  computer-use-linux state [APP_NAME]\n  computer-use-linux screenshot [--monitor INDEX|CONNECTOR|primary]\n  computer-use-linux monitors\n  computer-use-linux windows"
     );
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{abs_pointer, abs_test_report};
+    use super::{
+        abs_pointer, abs_test_report, monitors, screenshot, screenshot_monitor_arg,
+        screenshot_report,
+    };
+
+    fn args(values: &[&str]) -> impl Iterator<Item = String> {
+        values
+            .iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .into_iter()
+    }
+
+    #[test]
+    fn screenshot_monitor_arg_reads_both_spellings() {
+        assert_eq!(screenshot_monitor_arg(args(&[])).unwrap(), None);
+        assert_eq!(
+            screenshot_monitor_arg(args(&["--monitor", "1"])).unwrap(),
+            Some(monitors::MonitorSelector::Index(1))
+        );
+        assert_eq!(
+            screenshot_monitor_arg(args(&["--monitor=HDMI-2"])).unwrap(),
+            Some(monitors::MonitorSelector::Name("HDMI-2".to_string()))
+        );
+        assert_eq!(
+            screenshot_monitor_arg(args(&["--monitor", "primary"])).unwrap(),
+            Some(monitors::MonitorSelector::Name("primary".to_string()))
+        );
+    }
+
+    #[test]
+    fn screenshot_monitor_arg_rejects_bad_input() {
+        for bad in [
+            &["--monitor"][..],
+            &["--monitor="][..],
+            &["--monitor", ""][..],
+            &["--display", "1"][..],
+            &["1"][..],
+        ] {
+            assert!(screenshot_monitor_arg(args(bad)).is_err(), "{bad:?}");
+        }
+    }
+
+    fn sample_capture() -> screenshot::ScreenshotCapture {
+        screenshot::ScreenshotCapture {
+            mime_type: "image/png".to_string(),
+            data_url: "data:image/png;base64,AAAA".to_string(),
+            source: "test".to_string(),
+            width: 1920,
+            height: 1080,
+            coordinate_width: 1920,
+            coordinate_height: 1080,
+            scale: 1.0,
+            resized: false,
+            bytes: 3,
+            original_bytes: 3,
+            max_bytes: 2_097_152,
+            format: screenshot::ScreenshotOutputFormat::Png,
+            quality: None,
+        }
+    }
+
+    #[test]
+    fn screenshot_report_names_the_monitor_only_for_monitor_captures() {
+        let plain = screenshot_report(&sample_capture(), None);
+        assert_eq!(plain["width"], 1920);
+        assert!(plain.get("monitor").is_none());
+        assert!(plain.get("origin_x").is_none());
+
+        let crop = monitors::MonitorCrop {
+            connector: "HDMI-2".to_string(),
+            origin_x: 1920,
+            origin_y: 0,
+        };
+        let report = screenshot_report(&sample_capture(), Some(&crop));
+        assert_eq!(report["monitor"], "HDMI-2");
+        assert_eq!(report["origin_x"], 1920);
+        assert_eq!(report["origin_y"], 0);
+        assert_eq!(report["height"], 1080);
+        assert_eq!(report["data_url_length"], 26);
+    }
 
     #[test]
     fn abs_test_report_distinguishes_requested_and_emitted_coordinates() {

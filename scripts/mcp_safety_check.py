@@ -25,6 +25,7 @@ EXPECTED_TOOLS = {
     "get_app_state",
     "list_windows",
     "focused_window",
+    "list_monitors",
     "screenshot",
     "activate_window",
     "move_window",
@@ -103,6 +104,7 @@ POST_ACTION_CAPTURE_TOOLS = {
 }
 
 POST_ACTION_CAPTURE_PROPS = {
+    "monitor",
     "screenshot_after",
     "include_tree",
     "format",
@@ -119,6 +121,7 @@ READ_ONLY_TOOLS = {
     "get_app_state",
     "list_windows",
     "focused_window",
+    "list_monitors",
 }
 
 DESTRUCTIVE_MUTATING_TOOLS = {
