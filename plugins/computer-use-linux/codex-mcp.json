@@ -1,6 +1,6 @@
 {
   "mcpServers": {
-    "computer-use-linux": {
+    "take-my-computer": {
       "command": "./bin/computer-use-linux",
       "args": ["mcp"],
       "cwd": ".",
@@ -38,7 +38,9 @@
         "COMPUTER_USE_LINUX_NOTIFY_ON_COMPLETE",
         "COMPUTER_USE_LINUX_PERSIST_REMOTE_DESKTOP",
         "COMPUTER_USE_LINUX_SCREENSHOT_BACKEND",
-        "COMPUTER_USE_LINUX_XDOTOOL_TYPE_DELAY_MS"
+        "COMPUTER_USE_LINUX_XDOTOOL_TYPE_DELAY_MS",
+        "TAKE_MY_COMPUTER_POLICY",
+        "TAKE_MY_COMPUTER_SEND_APPS"
       ]
     }
   }

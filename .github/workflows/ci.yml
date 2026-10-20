@@ -278,7 +278,8 @@ jobs:
   publish-crate:
     name: publish crate
     needs: [release-binary]
-    if: startsWith(github.ref, 'refs/tags/v')
+    # Disabled in the take-my-computer fork: it does not publish outside GitHub releases.
+    if: false
     runs-on: ubuntu-latest
     env:
       CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
@@ -301,7 +302,8 @@ jobs:
   publish-npm:
     name: publish npm
     needs: [release-binary]
-    if: startsWith(github.ref, 'refs/tags/v')
+    # Disabled in the take-my-computer fork: it does not publish outside GitHub releases.
+    if: false
     runs-on: ubuntu-latest
     env:
       NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
@@ -317,7 +319,7 @@ jobs:
           name="$(node -p "require('./package.json').name")"
           version="$(node -p "require('./package.json').version")"
           test "v$version" = "$GITHUB_REF_NAME"
-          base="https://github.com/agent-sh/computer-use-linux/releases/download/v${version}"
+          base="https://github.com/RamaAditya49/take-my-computer/releases/download/v${version}"
           for asset in \
             computer-use-linux-x86_64-unknown-linux-gnu \
             computer-use-linux-aarch64-unknown-linux-gnu \
@@ -348,7 +350,8 @@ jobs:
   validate-published:
     name: zod schema (published npm)
     needs: [publish-npm]
-    if: startsWith(github.ref, 'refs/tags/v')
+    # Disabled in the take-my-computer fork: it does not publish outside GitHub releases.
+    if: false
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -383,7 +386,8 @@ jobs:
   notify-codex-desktop:
     name: open codex-desktop update reminder
     needs: [publish-crate, publish-npm]
-    if: startsWith(github.ref, 'refs/tags/v')
+    # Disabled in the take-my-computer fork: it does not publish outside GitHub releases.
+    if: false
     runs-on: ubuntu-latest
     permissions:
       contents: read

@@ -168,7 +168,7 @@ def check(kind, scenario):
 
 
 def main():
-    forwarded = json.loads((ROOT / "plugins/computer-use-linux/codex-mcp.json").read_text())["mcpServers"]["computer-use-linux"]["env_vars"]
+    forwarded = json.loads((ROOT / "plugins/computer-use-linux/codex-mcp.json").read_text())["mcpServers"]["take-my-computer"]["env_vars"]
     for suffix in ("INDICATOR", "INDICATOR_HIDE_TEXT", "INDICATOR_BIN", "AGENT_NAME"):
         assert "COMPUTER_USE_LINUX_" + suffix in forwarded, f"Codex does not forward {suffix}"
     for kind in ("plugin", "npm"):

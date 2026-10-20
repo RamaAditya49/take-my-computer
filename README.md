@@ -1,10 +1,63 @@
+# take-my-computer
+
+take-my-computer lets an AI agent operate a real Linux desktop like its owner: see, read, click, and type.
+It is an MCP server and a CLI. Any MCP host, such as Claude Code or Codex CLI, can start it.
+
+> **Fork of [agent-sh/computer-use-linux](https://github.com/agent-sh/computer-use-linux).**
+> The original project is by Avi Fenesh and uses the MIT license.
+> This fork keeps the upstream code, history, and license.
+> Binary names and `COMPUTER_USE_LINUX_*` variables stay the same, so upstream merges stay easy.
+
+## What is different
+
+- **Multi-monitor.** List the monitors, capture one monitor at native size, and click in coordinates relative to that monitor.
+- **Safety gate in the server.** The server enforces three modes: `confirm` (default), `full`, and `observe`. A kill switch stops all input. An audit log records every input action.
+- **Tested on GNOME 46 Wayland with 3 monitors.**
+- Everything from upstream stays: AT-SPI accessibility trees, portal screenshots, window targeting, and input on GNOME, KDE, Hyprland, niri, COSMIC, i3, and X11.
+
+## Quick start for Claude Code
+
+```bash
+claude plugin marketplace add RamaAditya49/take-my-computer
+claude plugin install take-my-computer@take-my-computer
+```
+
+Start a new Claude Code session. On first start, the plugin downloads the release binaries for its version and checks each file against its published `.sha256`. Ask the agent to run the `doctor` tool and follow the next step it reports.
+
+To use the server without the plugin, put `computer-use-linux` on `PATH` first (see [Option D](#option-d--prebuilt-binaries) or `./install.sh` below). Then add the server:
+
+```bash
+claude mcp add take-my-computer -s user -- computer-use-linux mcp
+```
+
+### Safety modes
+
+Set the mode with the `TAKE_MY_COMPUTER_POLICY` variable in the environment of the MCP server. For a plugin install, export it before you start Claude Code.
+
+| Mode | Behavior |
+| --- | --- |
+| `confirm` (default) | Read-only tools and low-impact input run. High-impact actions need your confirmation. |
+| `full` | All tools run without confirmation. The kill switch and the audit log still apply. |
+| `observe` | Only read-only tools run. Every tool that changes the desktop is refused. |
+
+Stop all input at once with `computer-use-linux stop`. Allow input again with `computer-use-linux resume`.
+To bind the stop command to a key, open Settings, Keyboard, Keyboard Shortcuts, Custom Shortcuts, and add a shortcut with the command `computer-use-linux stop`.
+The shortcut needs the CLI on `PATH`. A plugin-only install keeps its binary under `~/.cache/computer-use-linux/plugin/`, so use the full path there.
+
+The audit log is `~/.local/state/take-my-computer/audit.jsonl`. It stores the length and a SHA-256 hash of typed text, never the text.
+
+---
+
+## Upstream documentation
+
+The text below is the upstream README. Install commands that use GitHub now point to this fork.
+This fork does not publish to npm or crates.io. The commands below that use the npm package `@agent-sh/computer-use-linux` (the Pi extension and the npm wrapper) install the upstream release, without the changes above.
+
 <div align="center">
-  <h1>computer-use-linux</h1>
+  <h3>computer-use-linux</h3>
   <p><strong>Native Linux desktop control for AI agents — over MCP, Pi native tools, and CLI.</strong></p>
   <p>
-    <a href="https://github.com/agent-sh/computer-use-linux/actions/workflows/ci.yml"><img src="https://github.com/agent-sh/computer-use-linux/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-    <a href="https://crates.io/crates/computer-use-linux"><img src="https://img.shields.io/crates/v/computer-use-linux.svg" alt="crates.io"></a>
-    <a href="https://www.npmjs.com/package/@agent-sh/computer-use-linux"><img src="https://img.shields.io/npm/v/@agent-sh/computer-use-linux.svg" alt="npm"></a>
+    <a href="https://github.com/RamaAditya49/take-my-computer/actions/workflows/ci.yml"><img src="https://github.com/RamaAditya49/take-my-computer/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"></a>
   </p>
 </div>
@@ -19,15 +72,15 @@ Pick the setup that matches your agent or shell workflow:
 
 | Host / workflow | Install command |
 | --- | --- |
-| **Claude Code** (plugin + skill) | `claude plugin marketplace add agent-sh/computer-use-linux && claude plugin install computer-use-linux@computer-use-linux` |
-| **Codex CLI** (plugin + skill) | `codex plugin marketplace add agent-sh/computer-use-linux && codex plugin add computer-use-linux@computer-use-linux` |
-| **Pi Coding Agent** (native lazy-loaded tools) | `pi install npm:@agent-sh/computer-use-linux` |
-| **Hermes Agent** (CLI + skill + MCP server) | `npm install -g @agent-sh/computer-use-linux && hermes skills tap add agent-sh/computer-use-linux && hermes skills install agent-sh/computer-use-linux/computer-use-linux && hermes mcp add computer-use-linux --command computer-use-linux --args mcp` |
-| **CLI + any stdio MCP client** (npm) | `npm install -g @agent-sh/computer-use-linux` |
-| **CLI + system setup from source** | `git clone https://github.com/agent-sh/computer-use-linux && cd computer-use-linux && ./install.sh` |
-| **Rust crate (`crates.io`)** | `cargo install computer-use-linux` |
+| **Claude Code** (plugin + skill) | `claude plugin marketplace add RamaAditya49/take-my-computer && claude plugin install take-my-computer@take-my-computer` |
+| **Codex CLI** (plugin + skill) | `codex plugin marketplace add RamaAditya49/take-my-computer && codex plugin add take-my-computer@take-my-computer` |
+| **Pi Coding Agent** (native lazy-loaded tools, upstream package) | `pi install npm:@agent-sh/computer-use-linux` |
+| **Hermes Agent** (skill + MCP server; needs the CLI on `PATH`) | `hermes skills tap add RamaAditya49/take-my-computer && hermes skills install RamaAditya49/take-my-computer/computer-use-linux && hermes mcp add computer-use-linux --command computer-use-linux --args mcp` |
+| **CLI + any stdio MCP client** (release binaries) | See [Option D](#option-d--prebuilt-binaries) |
+| **CLI + system setup from source** | `git clone https://github.com/RamaAditya49/take-my-computer && cd take-my-computer && ./install.sh` |
+| **Rust binaries from Git** | `cargo install --git https://github.com/RamaAditya49/take-my-computer` |
 
-Verify desktop readiness from the shell (after installing the CLI on `PATH` via `npm install -g @agent-sh/computer-use-linux`, `./install.sh`, or `cargo install computer-use-linux`):
+Verify desktop readiness from the shell (after installing the CLI on `PATH` via the release binaries, `./install.sh`, or `cargo install --git`):
 
 ```bash
 computer-use-linux doctor | jq .readiness
@@ -37,7 +90,7 @@ computer-use-linux setup-window-targeting     # install GNOME Wayland window-con
 
 > **Plugin-only or Pi-only installs:** The Claude Code / Codex plugin launcher and `pi install` manage private cached binaries and do not add `computer-use-linux` to `PATH`. Either run the MCP `doctor` / `setup_accessibility` / `setup_window_targeting` tools (or `computer_use_linux_doctor` in Pi) directly from your agent, or also install the CLI above when you want shell subcommands on `PATH`.
 
-The Rust crate is published as [`computer-use-linux`](https://crates.io/crates/computer-use-linux) and the npm package as [`@agent-sh/computer-use-linux`](https://www.npmjs.com/package/@agent-sh/computer-use-linux). Prebuilt `x86_64` and `aarch64` Linux binaries ship with the [latest release](https://github.com/agent-sh/computer-use-linux/releases/latest).
+This fork does not publish to crates.io or npm. Prebuilt `x86_64` and `aarch64` Linux binaries ship with the [latest release](https://github.com/RamaAditya49/take-my-computer/releases/latest).
 
 > Need an **isolated** desktop where the agent never touches your real mouse, keyboard, or focused window? Use the sibling project [**`agent-workspace-linux`**](https://github.com/agent-sh/agent-workspace-linux) alongside this one.
 
@@ -187,8 +240,8 @@ If you run on a desktop not covered above, or a covered backend does not come up
 Installs system packages on Debian/Ubuntu, Fedora/RHEL-like, Arch-like, or Artix systems; installs Rust if needed; builds all three release binaries (`computer-use-linux`, `computer-use-linux-cosmic`, and `computer-use-linux-indicator`); installs them to `~/.local/bin`; configures `ydotoold` as a systemd user service when available; enables GNOME AT-SPI settings when running under GNOME; and installs the bundled GNOME Shell extension on GNOME Wayland.
 
 ```bash
-git clone https://github.com/agent-sh/computer-use-linux
-cd computer-use-linux
+git clone https://github.com/RamaAditya49/take-my-computer
+cd take-my-computer
 ./install.sh
 # log out and back in if the GNOME extension was newly installed
 computer-use-linux doctor | jq .readiness
@@ -196,19 +249,13 @@ computer-use-linux doctor | jq .readiness
 
 `ydotool` is an optional fallback. On X11, the installer includes `xdotool` as the required keyboard backend. If ydotool is unavailable from the configured repositories, the installer continues, but `doctor` still requires a keyboard-capable RemoteDesktop portal on Wayland or xdotool on X11; direct uinput provides absolute pointer input only. On non-systemd hosts, automatic `ydotoold` service setup is skipped and the installer prints a command suitable for a per-user supervisor. For an unrecognized distro, pass `--package-manager apt|dnf|pacman`; `--force-unknown-distro` auto-selects only when exactly one of those managers is available.
 
-### Option B — `cargo install` (Rust binaries, no system setup)
+### Option B — `cargo install` from Git (Rust binaries, no system setup)
 
-Installs all three Rust binaries from crates.io. You still handle the system-level pieces yourself: AT-SPI, desktop portals, the optional `ydotoold` fallback, and the GNOME extension if you need the GNOME Wayland exact-focus backend.
+Installs all three Rust binaries from this repository. This fork does not publish to crates.io. You still handle the system-level pieces yourself: AT-SPI, desktop portals, the optional `ydotoold` fallback, and the GNOME extension if you need the GNOME Wayland exact-focus backend.
 
 ```bash
-cargo install computer-use-linux
+cargo install --git https://github.com/RamaAditya49/take-my-computer
 computer-use-linux doctor
-```
-
-For unreleased changes from `main`, install directly from Git:
-
-```bash
-cargo install --git https://github.com/agent-sh/computer-use-linux
 ```
 
 Then, as needed:
@@ -221,9 +268,9 @@ computer-use-linux setup                      # gsettings AT-SPI bridge
 computer-use-linux setup-window-targeting     # GNOME Shell extension
 ```
 
-### Option C — npm wrapper (binary download)
+### Option C — npm wrapper (binary download, upstream release)
 
-Good for users who already have Node.js and want a no-Rust install. The npm package downloads and verifies the matching `computer-use-linux`, `computer-use-linux-cosmic`, and `computer-use-linux-indicator` binaries during install, then the wrapper wires `COMPUTER_USE_LINUX_COSMIC_HELPER` and `COMPUTER_USE_LINUX_INDICATOR_BIN` to the bundled helpers automatically.
+This fork does not publish the npm package. The command below installs the upstream release, without the take-my-computer changes. Good for users who already have Node.js and want a no-Rust install. The npm package downloads and verifies the matching `computer-use-linux`, `computer-use-linux-cosmic`, and `computer-use-linux-indicator` binaries during install, then the wrapper wires `COMPUTER_USE_LINUX_COSMIC_HELPER` and `COMPUTER_USE_LINUX_INDICATOR_BIN` to the bundled helpers automatically.
 
 ```bash
 npm install -g @agent-sh/computer-use-linux
@@ -236,11 +283,11 @@ You will still need AT-SPI enabled (`computer-use-linux setup`) and one input ba
 
 Linux x86_64 / aarch64 builds are published with each tag. Each binary ships a `.sha256` next to it.
 
-- Latest release: <https://github.com/agent-sh/computer-use-linux/releases/latest>
+- Latest release: <https://github.com/RamaAditya49/take-my-computer/releases/latest>
 
 ```bash
 target=x86_64-unknown-linux-gnu
-base=https://github.com/agent-sh/computer-use-linux/releases/latest/download
+base=https://github.com/RamaAditya49/take-my-computer/releases/latest/download
 for binary in computer-use-linux computer-use-linux-cosmic computer-use-linux-indicator; do
   asset="$binary-$target"
   curl -L -O "$base/$asset"
@@ -268,15 +315,15 @@ else is installed.
 Claude Code:
 
 ```bash
-claude plugin marketplace add agent-sh/computer-use-linux
-claude plugin install computer-use-linux@computer-use-linux
+claude plugin marketplace add RamaAditya49/take-my-computer
+claude plugin install take-my-computer@take-my-computer
 ```
 
 Codex CLI:
 
 ```bash
-codex plugin marketplace add agent-sh/computer-use-linux
-codex plugin add computer-use-linux@computer-use-linux
+codex plugin marketplace add RamaAditya49/take-my-computer
+codex plugin add take-my-computer@take-my-computer
 ```
 
 Start a new session afterwards. To run your own build instead of the pinned
@@ -333,6 +380,8 @@ Restart Claude Desktop. The tools should appear in the tools list.
 pi install npm:@agent-sh/computer-use-linux
 ```
 
+This fork does not publish the Pi package. The command installs the upstream release, without the take-my-computer changes.
+
 Restart Pi or run `/reload`. The package exposes one small loader initially;
 the real tools keep their upstream schemas and are enabled only when Computer
 Use is needed:
@@ -374,8 +423,8 @@ from older adapter-based installs.
 Install the companion Hermes skill so Hermes has the desktop-specific runbook:
 
 ```bash
-hermes skills tap add agent-sh/computer-use-linux
-hermes skills install agent-sh/computer-use-linux/computer-use-linux
+hermes skills tap add RamaAditya49/take-my-computer
+hermes skills install RamaAditya49/take-my-computer/computer-use-linux
 ```
 
 The skill is optional but recommended for Hermes users. It teaches Hermes how to install, configure, verify, and call the Linux desktop MCP safely. It follows the same `skills/<name>/SKILL.md` tap layout used by Hermes community skills.
@@ -410,11 +459,11 @@ You can verify both sides before asking Hermes to use the desktop:
 
 ```bash
 computer-use-linux doctor | jq .readiness
-hermes skills inspect agent-sh/computer-use-linux/computer-use-linux
+hermes skills inspect RamaAditya49/take-my-computer/computer-use-linux
 hermes chat --toolsets mcp-computer-use-linux -q "List the current desktop windows."
 ```
 
-For one-off installs without adding the tap first, Hermes also accepts `hermes skills install agent-sh/computer-use-linux/skills/computer-use-linux`.
+For one-off installs without adding the tap first, Hermes also accepts `hermes skills install RamaAditya49/take-my-computer/skills/computer-use-linux`.
 
 ### Generic MCP client
 
@@ -619,14 +668,9 @@ Built on top of:
 
 ## Publishing
 
-Publishing is tag-driven from GitHub Actions. The repository needs these Actions secrets:
+Releases are tag-driven from GitHub Actions. This fork does not publish to crates.io or npm, so it needs no registry secrets.
 
-```bash
-gh secret set CARGO_REGISTRY_TOKEN -R agent-sh/computer-use-linux
-gh secret set NPM_TOKEN -R agent-sh/computer-use-linux
-```
-
-Then bump `Cargo.toml` and `package.json` together, update `CHANGELOG.md`, and push a `vX.Y.Z` tag. CI runs the full Rust and MCP safety gates, builds release assets for both architectures, publishes `computer-use-linux` to crates.io, and publishes the npm wrapper after the GitHub release binaries are available.
+Bump `Cargo.toml`, `Cargo.lock`, `package.json`, the plugin launcher, both plugin manifests, and `.claude-plugin/marketplace.json` together. Update `CHANGELOG.md`. Push a `vX.Y.Z` tag. CI runs the full Rust and MCP safety gates, then builds the release assets for both architectures and attaches them to the GitHub release. The plugin launcher downloads those assets.
 
 ## License
 

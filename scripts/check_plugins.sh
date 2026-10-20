@@ -41,6 +41,19 @@ for path, get in checks.items():
         found = get(json.load(f))
     if found != version:
         sys.exit(f"check_plugins: {path} version {found} != Cargo version {version}")
+
+# The fork ships under one name. The launcher binary keeps its upstream name.
+names = {
+    ".claude-plugin/marketplace.json": lambda d: (d["name"], d["plugins"][0]["name"]),
+    "plugins/computer-use-linux/.claude-plugin/plugin.json": lambda d: (d["name"], next(iter(d["mcpServers"]))),
+    "plugins/computer-use-linux/.codex-plugin/plugin.json": lambda d: (d["name"],),
+    "plugins/computer-use-linux/codex-mcp.json": lambda d: (next(iter(d["mcpServers"])),),
+}
+for path, get in names.items():
+    with open(path) as f:
+        found = get(json.load(f))
+    if any(name != "take-my-computer" for name in found):
+        sys.exit(f"check_plugins: {path} names {found} must all be take-my-computer")
 PY
 
 diff -r skills/computer-use-linux "$plugin/skills/computer-use-linux" >/dev/null ||

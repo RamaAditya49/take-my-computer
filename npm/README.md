@@ -3,6 +3,10 @@
 Native Linux desktop observation and control for AI agents — published as
 [`@agent-sh/computer-use-linux`](https://www.npmjs.com/package/@agent-sh/computer-use-linux).
 
+> take-my-computer is a fork of this project. It does not publish to npm. The npm package above is
+> the upstream release. For the fork, use the plugin steps below or the release binaries at
+> <https://github.com/RamaAditya49/take-my-computer/releases>.
+
 Provides:
 - **`computer-use-linux` CLI & stdio MCP server** (`computer-use-linux mcp`)
 - **Native Pi coding agent extension** (`computer_use_linux_*` tools)
@@ -55,12 +59,12 @@ a result.
 
 ```bash
 # Claude Code
-claude plugin marketplace add agent-sh/computer-use-linux
-claude plugin install computer-use-linux@computer-use-linux
+claude plugin marketplace add RamaAditya49/take-my-computer
+claude plugin install take-my-computer@take-my-computer
 
 # Codex CLI
-codex plugin marketplace add agent-sh/computer-use-linux
-codex plugin add computer-use-linux@computer-use-linux
+codex plugin marketplace add RamaAditya49/take-my-computer
+codex plugin add take-my-computer@take-my-computer
 ```
 
 The plugin registers the MCP server and caches private release binaries on first
@@ -71,8 +75,8 @@ want the shell CLI).
 
 ```bash
 npm install -g @agent-sh/computer-use-linux
-hermes skills tap add agent-sh/computer-use-linux
-hermes skills install agent-sh/computer-use-linux/computer-use-linux
+hermes skills tap add RamaAditya49/take-my-computer
+hermes skills install RamaAditya49/take-my-computer/computer-use-linux
 hermes mcp add computer-use-linux --command computer-use-linux --args mcp
 hermes mcp test computer-use-linux
 hermes mcp configure computer-use-linux
