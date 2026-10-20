@@ -25,7 +25,7 @@ First release of take-my-computer, a fork of `agent-sh/computer-use-linux` 0.7.2
 - Forward `TAKE_MY_COMPUTER_POLICY` and `TAKE_MY_COMPUTER_SEND_APPS` to the Codex MCP server.
 - Point crate, package, plugin, skill, and contributor documentation links to the fork.
 - Check the `take-my-computer` names in `scripts/check_plugins.sh`.
-- CI: keep the checks and the release binary job. Remove the crates.io, npm, and codex-desktop-linux reminder jobs. Disable the sync reminder workflow.
+- CI: keep the checks and the release binary job. Disable the crates.io, npm, published-package, and codex-desktop-linux reminder jobs. Disable the sync reminder workflow.
 
 ### Not changed
 
