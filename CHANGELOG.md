@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.20-tmc.1] - 2026-10-21
+
+First release of take-my-computer, a fork of `agent-sh/computer-use-linux` 0.7.20. Binary names and `COMPUTER_USE_LINUX_*` variables are unchanged.
+
+### Added
+
+- Multi-monitor capture and monitor-relative click coordinates.
+- Server-enforced safety gate with the modes `confirm`, `full`, and `observe`, a kill switch, and an audit log. Set the mode with `TAKE_MY_COMPUTER_POLICY`.
+- README section for the fork, with Claude Code quick start and safety modes. The upstream README stays below it.
+- `Copyright (c) 2026 Rama Aditya` line in `LICENSE`. The upstream copyright line stays.
+
+### Changed
+
+- Rename the Claude Code and Codex plugin, the marketplace, and the MCP server entry to `take-my-computer`. The owner is `RamaAditya49`.
+- Download plugin and npm wrapper release binaries from `https://github.com/RamaAditya49/take-my-computer/releases`. Release assets keep their `computer-use-linux-*` names.
+- Forward `TAKE_MY_COMPUTER_POLICY` and `TAKE_MY_COMPUTER_SEND_APPS` to the Codex MCP server.
+- Point crate, package, plugin, skill, and contributor documentation links to the fork.
+- Check the `take-my-computer` names in `scripts/check_plugins.sh`.
+- CI: keep the checks and the release binary job. Remove the crates.io, npm, and codex-desktop-linux reminder jobs. Disable the sync reminder workflow.
+
+### Not changed
+
+- The Rust crate is not published to crates.io. The npm package is not published to npm. The Pi extension keeps the upstream npm package name.
+
 ## [0.7.20] - 2026-10-18
 
 ### Fixed
@@ -836,7 +860,8 @@ pages; also bumps the MCP server's advertised version string to match.
 - Validated against GNOME 50.1 on Wayland (Ubuntu 25.10).
 - KDE / Sway / Hyprland untested — see README support matrix.
 
-[Unreleased]: https://github.com/agent-sh/computer-use-linux/compare/v0.7.20...HEAD
+[Unreleased]: https://github.com/RamaAditya49/take-my-computer/compare/v0.7.20-tmc.1...HEAD
+[0.7.20-tmc.1]: https://github.com/RamaAditya49/take-my-computer/releases/tag/v0.7.20-tmc.1
 [0.7.20]: https://github.com/agent-sh/computer-use-linux/compare/v0.7.19...v0.7.20
 [0.7.19]: https://github.com/agent-sh/computer-use-linux/compare/v0.7.18...v0.7.19
 [0.7.18]: https://github.com/agent-sh/computer-use-linux/compare/v0.7.17...v0.7.18
