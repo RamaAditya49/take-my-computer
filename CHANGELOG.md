@@ -17,6 +17,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Refuse `press_key` with one printable character into a known password field in `confirm` mode.
 - Write two audit lines for each call that runs, `start` before the input and `end` after it, with a shared `call_id`. Refuse the call when the `start` line cannot be written. A refused call writes one `refused` line.
 - Show the whole `run_shell` command in the confirmation when it has 2000 characters or fewer. Refuse a longer command in `confirm` mode.
+- Treat `Ctrl+M` and `Ctrl+J` as Enter, with any extra modifiers. In a terminal, treat `Ctrl+O` as Enter too. The same Enter rules apply.
+- Split the `run_shell` confirmation on every Unicode line break: LF, CR, NEL, vertical tab, form feed, line separator, and paragraph separator. Show every other control character and every format character as a `\u{XXXX}` escape. Normal text stays as it is.
+- Refuse every `press_key` into a known password field in `confirm` mode, except Tab, ISO_Left_Tab, Escape, BackSpace, Delete, the arrow keys, Home, End, Return, KP_Enter, Enter, and chords of these keys with Shift only. This replaces the rule for one printable character.
+- Use the hit test of a coordinate `click` only when the snapshot belongs to the target window or to the focused window, and is younger than 30 seconds. Skip container elements and the snapshot root. Otherwise the point is unresolved. An unknown window pid also leaves the point unresolved.
+
+### Documentation
+
+- State in the README that the gate guards against mistakes of an agent and is not a sandbox. Add a "Limits" list to the safety gate section.
 
 ### Changed
 
