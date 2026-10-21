@@ -414,7 +414,11 @@ def assert_policy_gate_contract(binary: pathlib.Path) -> None:
     with tempfile.TemporaryDirectory(prefix="tmc-policy-") as state_home:
         client = McpClient(
             binary,
-            {"TAKE_MY_COMPUTER_POLICY": "observe", "XDG_STATE_HOME": state_home},
+            {
+                "TAKE_MY_COMPUTER_POLICY": "observe",
+                "TAKE_MY_COMPUTER_TERMINAL_APPS": " Warp , ROXTERM ,",
+                "XDG_STATE_HOME": state_home,
+            },
         )
         try:
             client.request("initialize", initialize_params)
@@ -424,9 +428,12 @@ def assert_policy_gate_contract(binary: pathlib.Path) -> None:
             )
             if status.get("mode") != "observe" or status.get("kill_switch_active") is not False:
                 raise AssertionError(f"unexpected policy_status: {status!r}")
-            for field in ["send_on_enter_apps", "audit_log", "kill_switch_file"]:
+            for field in ["send_on_enter_apps", "terminal_apps", "audit_log", "kill_switch_file"]:
                 if not status.get(field):
                     raise AssertionError(f"policy_status is missing {field}: {status!r}")
+            # The override variable replaces the default terminal list.
+            if status["terminal_apps"] != ["warp", "roxterm"]:
+                raise AssertionError(f"terminal override was not applied: {status!r}")
             result = client.request(
                 "tools/call", {"name": "click", "arguments": {"x": 10, "y": 10}}
             )["result"]
@@ -457,11 +464,17 @@ def assert_policy_gate_contract(binary: pathlib.Path) -> None:
                 )
                 if payload.get("ok") is not False or "observe" not in json.dumps(payload):
                     raise AssertionError(f"observe mode did not refuse {name}: {payload!r}")
+            records = audit_records(state_home)
             refused_tools = {
-                record["tool"] for record in audit_records(state_home) if record.get("decision") == "refused"
+                record["tool"] for record in records if record.get("decision") == "refused"
             }
             if refused_tools != {"click"} | set(mutating_calls):
                 raise AssertionError(f"observe refusals were not all audited: {sorted(refused_tools)!r}")
+            # A refused call writes one line with phase "refused" and its own call_id.
+            if any(record.get("phase") != "refused" or record.get("ok") is not False for record in records):
+                raise AssertionError(f"observe refusals have the wrong phase: {records!r}")
+            if len(records) != 1 + len(mutating_calls) or len({r.get("call_id") for r in records}) != len(records):
+                raise AssertionError(f"observe refusals need one line and one call_id each: {records!r}")
         finally:
             client.close()
 
@@ -488,6 +501,48 @@ def assert_policy_gate_contract(binary: pathlib.Path) -> None:
         records = audit_records(state_home)
         if not records or records[-1].get("decision") != "refused":
             raise AssertionError(f"kill switch refusal was not audited: {records!r}")
+        if records[-1].get("phase") != "refused" or not records[-1].get("call_id"):
+            raise AssertionError(f"kill switch refusal has no phase or call_id: {records!r}")
+
+    # Confirm mode: a shell command that is too long to show in full is
+    # refused before any dialog. The audit log never holds the command.
+    with tempfile.TemporaryDirectory(prefix="tmc-policy-") as state_home, tempfile.TemporaryDirectory(
+        prefix="tmc-runtime-"
+    ) as runtime_dir:
+        client = McpClient(
+            binary,
+            {
+                "COMPUTER_USE_LINUX_ENABLE_SHELL": "1",
+                "TAKE_MY_COMPUTER_POLICY": "confirm",
+                "XDG_STATE_HOME": state_home,
+                "XDG_RUNTIME_DIR": runtime_dir,
+            },
+        )
+        try:
+            client.request("initialize", initialize_params)
+            client.notify("notifications/initialized", {})
+            status = tool_payload(
+                client.request("tools/call", {"name": "policy_status", "arguments": {}})["result"]
+            )
+            for name in ["gnome-terminal", "kgx", "ptyxis", "konsole", "kitty", "xterm", "terminal"]:
+                if name not in status.get("terminal_apps", []):
+                    raise AssertionError(f"default terminal list is missing {name}: {status!r}")
+            command = "echo " + "Z" * 2100
+            payload = tool_payload(
+                client.request(
+                    "tools/call", {"name": SHELL_TOOL, "arguments": {"command": command}}
+                )["result"]
+            )
+            if payload.get("ok") is not False or "TAKE_MY_COMPUTER_POLICY=full" not in (payload.get("error") or ""):
+                raise AssertionError(f"long shell command was not refused: {payload!r}")
+            records = audit_records(state_home)
+            if len(records) != 1 or records[0].get("phase") != "refused" or records[0].get("reason") != "command_too_long":
+                raise AssertionError(f"long shell command refusal was not audited once: {records!r}")
+            raw = pathlib.Path(state_home, "take-my-computer", "audit.jsonl").read_text(encoding="utf-8")
+            if "ZZZZZZZZ" in raw:
+                raise AssertionError("the audit log holds the shell command")
+        finally:
+            client.close()
 
 def main() -> int:
     parser = argparse.ArgumentParser()
@@ -663,6 +718,16 @@ def main() -> int:
             raise AssertionError(f"{SHELL_TOOL} smoke failed: {shell_result!r}")
         if len(shell_result.get("command_sha256") or "") != 64:
             raise AssertionError(f"{SHELL_TOOL} did not return an audit digest: {shell_result!r}")
+        # One call writes a start line before the command and an end line after it.
+        shell_records = audit_records(shell_state.name)
+        if [record.get("phase") for record in shell_records] != ["start", "end"]:
+            raise AssertionError(f"{SHELL_TOOL} audit phases are wrong: {shell_records!r}")
+        if shell_records[0].get("call_id") != shell_records[1].get("call_id") or not shell_records[0].get("call_id"):
+            raise AssertionError(f"{SHELL_TOOL} audit lines do not share a call_id: {shell_records!r}")
+        if "ok" in shell_records[0] or shell_records[1].get("ok") is not True:
+            raise AssertionError(f"{SHELL_TOOL} audit ok flags are wrong: {shell_records!r}")
+        if "shell-ok" in json.dumps(shell_records) or "EXPLICIT" in json.dumps(shell_records):
+            raise AssertionError(f"{SHELL_TOOL} audit lines hold the command: {shell_records!r}")
     finally:
         shell_client.close()
         shell_home.cleanup()
