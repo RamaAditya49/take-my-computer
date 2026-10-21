@@ -263,12 +263,39 @@ fn resolve_state_dir(get: &impl Fn(&str) -> Option<String>) -> PathBuf {
                 .filter(|path| path.is_absolute())
                 .map(|dir| dir.join("take-my-computer-state"))
         })
-        .unwrap_or_else(|| {
-            // SAFETY: getuid has no preconditions and cannot fail.
-            let uid = unsafe { libc::getuid() };
-            env::temp_dir().join(format!("take-my-computer-state-{uid}"))
-        });
+        // Never fall back to the shared temp dir: other users can plant files
+        // and symlinks there. Without a private base the gate fails closed,
+        // because it cannot create the state dir and refuses every input.
+        .or_else(|| passwd_home().map(|home| home.join(".local/state")))
+        .unwrap_or_else(|| PathBuf::from("/nonexistent"));
     base.join("take-my-computer")
+}
+
+/// The home directory of the current user from the passwd database.
+fn passwd_home() -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut buf = vec![0 as libc::c_char; 16 * 1024];
+    // SAFETY: passwd is plain data, so all zero bytes is a valid value.
+    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut result: *mut libc::passwd = std::ptr::null_mut();
+    // SAFETY: every pointer refers to a live local buffer of the stated size,
+    // and getuid has no preconditions.
+    let rc = unsafe {
+        libc::getpwuid_r(
+            libc::getuid(),
+            &mut pwd,
+            buf.as_mut_ptr(),
+            buf.len(),
+            &mut result,
+        )
+    };
+    if rc != 0 || result.is_null() || pwd.pw_dir.is_null() {
+        return None;
+    }
+    // SAFETY: on success pw_dir points to a NUL-terminated string inside buf.
+    let dir = unsafe { std::ffi::CStr::from_ptr(pwd.pw_dir) };
+    let path = PathBuf::from(std::ffi::OsStr::from_bytes(dir.to_bytes()));
+    path.is_absolute().then_some(path)
 }
 
 /// An empty or blank list means "use the default list". That is the safe
@@ -3212,6 +3239,18 @@ mod tests {
         // The same symlink is fine when the user owns it.
         std::os::unix::fs::lchown(&link, Some(0), Some(0)).unwrap();
         ensure_dir(&link.join("take-my-computer")).unwrap();
+    }
+
+    #[test]
+    fn without_home_the_state_dir_comes_from_passwd_not_the_temp_dir() {
+        let home = passwd_home().expect("the test user has a passwd entry");
+        assert!(home.is_absolute());
+        let config = PolicyConfig::from_lookup(|_| None);
+        assert_eq!(
+            config.state_dir,
+            home.join(".local/state").join("take-my-computer")
+        );
+        assert!(!config.state_dir.starts_with(env::temp_dir()));
     }
 
     #[test]
