@@ -40,6 +40,8 @@ Set the mode with the `TAKE_MY_COMPUTER_POLICY` variable in the environment of t
 | `full` | All tools run without confirmation. The kill switch and the audit log still apply. |
 | `observe` | Only read-only tools run. Every tool that changes the desktop is refused. |
 
+The gate guards against mistakes of an agent. It is not a sandbox against a hostile agent. For untrusted work, use `observe` mode, or run the agent under a separate user account or in a VM. See "Limits" in the section "Safety gate (take-my-computer)".
+
 Stop all input at once with `computer-use-linux stop`. Allow input again with `computer-use-linux resume`.
 To bind the stop command to a key, open Settings, Keyboard, Keyboard Shortcuts, Custom Shortcuts, and add a shortcut with the command `computer-use-linux stop`.
 The shortcut needs the CLI on `PATH`. A plugin-only install keeps its binary under `~/.cache/computer-use-linux/plugin/`, so use the full path there.
@@ -244,25 +246,29 @@ Set the mode with `TAKE_MY_COMPUTER_POLICY`. An unknown value falls back to `con
 In `confirm` mode these actions need confirmation:
 
 - `click` or `perform_action` on an element whose name or description has a commit word: send, submit, delete, remove, pay, buy, purchase, checkout, publish, post, transfer, confirm, approve, kirim, hapus, bayar, beli, terbitkan, posting, setujui, konfirmasi. Matching is whole-word and case-insensitive, so "Postman" does not match "post".
-- `click` at a pixel (`x` and `y`). The gate looks up the point in the last `get_app_state` snapshot and picks the smallest element that holds it. If that element has a commit word, the click needs confirmation. If no element holds the point, the click needs confirmation only when the target window is known and is a send-on-Enter app. A point given with `monitor` is converted to a desktop point first. The gate never starts a new accessibility lookup for this check.
-- `press_key` with Return, KP_Enter, or Enter (any modifiers) when the focused or targeted window belongs to a send-on-Enter app. The default list is telegram, whatsapp, slack, discord, signal, element, teams, thunderbird, evolution, geary. Set `TAKE_MY_COMPUTER_SEND_APPS` to a comma-separated list to replace it. Entries are case-insensitive substrings of the app id, wm class, or title. If the window is unknown, Enter needs confirmation.
+- `click` at a pixel (`x` and `y`). The gate looks up the point in the last `get_app_state` snapshot and picks the smallest control that holds it. Containers (application, window, frame, panel, filler, scroll pane, layered pane, root pane, viewport, section, document frame) and the root of the snapshot do not count. The snapshot counts only when it belongs to the target window or to the focused window, and it is younger than 30 seconds. If that control has a commit word, the click needs confirmation. If no control counts, the point is unresolved, and the click needs confirmation only when the target window is known and is a send-on-Enter app. A point given with `monitor` is converted to a desktop point first. The gate never starts a new accessibility lookup for this check.
+- `press_key` with Return, KP_Enter, or Enter (any modifiers) when the focused or targeted window belongs to a send-on-Enter app. `Ctrl+M` and `Ctrl+J` (any extra modifiers) count as Enter, because a terminal reads them as Enter. In a terminal or in an unknown window, `Ctrl+O` counts as Enter too. The default list is telegram, whatsapp, slack, discord, signal, element, teams, thunderbird, evolution, geary. Set `TAKE_MY_COMPUTER_SEND_APPS` to a comma-separated list to replace it. Entries are case-insensitive substrings of the app id, wm class, or title. If the window is unknown, Enter needs confirmation.
 - `press_key` with Return, KP_Enter, Enter, or space (any modifiers), and `type_text` with a line break, when the focused element has a commit word in its name. The key presses that control.
 - `press_key` with Return, KP_Enter, or Enter, and `type_text` with a line break, when the window is a terminal, because Enter runs a shell command. The default terminal list is gnome-terminal, kgx, ptyxis, console, konsole, kitty, alacritty, foot, wezterm, xterm, tilix, terminator, ghostty, terminal. Set `TAKE_MY_COMPUTER_TERMINAL_APPS` to a comma-separated list to replace it. Matching is the same as for the send-on-Enter list. `policy_status` and `computer-use-linux policy` show both lists as `send_on_enter_apps` and `terminal_apps`.
 - `type_text` with a line break in a send-on-Enter app (or an unknown window), because a line break sends the message.
 - `perform_action` or `set_value` on an element that is not in the last `get_app_state` snapshot.
 - `setup_accessibility`, `setup_window_targeting`, and `run_shell`.
 
-`type_text` or `set_value` into a password field is refused in `confirm` mode. `press_key` with one printable character (for example `a` or `7`) into a password field is refused too.
+`type_text` or `set_value` into a password field is refused in `confirm` mode. `press_key` into a password field is refused too, except for these keys: Tab, ISO_Left_Tab, Escape, BackSpace, Delete, Left, Right, Up, Down, Home, End, Return, KP_Enter, Enter, and chords of these keys with Shift only. Letters, digits, space, and shortcuts such as `Ctrl+V` can type into the field, so they are refused.
 
-`run_shell` shows the whole command in the confirmation when it has 2000 characters or fewer. Each line of the command is shown with a `>` prefix, and control characters show as escapes. A longer command is refused in `confirm` mode. Mode `full` allows it.
+`run_shell` shows the whole command in the confirmation when it has 2000 characters or fewer. Each line of the command is shown with a `>` prefix. Every Unicode line break (LF, CR, NEL, vertical tab, form feed, line separator, paragraph separator) starts a new line. Other control characters and hidden format characters show as `\u{XXXX}` escapes. Normal text in any script shows as it is. A longer command is refused in `confirm` mode. Mode `full` allows it.
 
 `screenshot` is gated only when it raises a window (a window target with `raise_window` not set to `false`).
 
-**Known limits.** The coordinate-click check and the password checks need accessibility data. Without AT-SPI, or when the window or its focused element is unknown, these checks cannot see the target and the call is rated from the facts that are known:
+**Limits.** The gate guards against mistakes of an agent. It is not a sandbox against a hostile agent.
 
-- A coordinate click uses the last `get_app_state` snapshot. If the snapshot is old or empty, no element is found. Take a fresh snapshot before you click.
+- The gate catches common agent mistakes, such as a click on a Send button or Enter in a chat. An agent that has desktop input can still find other ways to act, for example a shortcut, a menu, a drag, or a command typed into a terminal.
+- Coordinate clicks and password checks need accessibility data. Without it, or when the window or its focused element is unknown, the gate cannot see the control under the point or the password field. It rates the call from the facts that it knows.
+- A coordinate click needs a snapshot of the target window that is younger than 30 seconds. Take a fresh `get_app_state` before you click. With an old or foreign snapshot, or with an unknown window, the point is unresolved.
+- Without the GNOME window-targeting extension, the window is unknown. In `confirm` mode, every Enter then needs confirmation.
 - The password check reads the role of the focused element. If the role is unknown, the check allows the call. The same holds for the commit-word check of Enter and space.
 - The commit-word check of a focused element reads its name. It does not read its description.
+- For untrusted work, use `observe` mode, or run the agent under a separate user account or in a VM.
 
 Confirmation uses these channels, in order:
 
