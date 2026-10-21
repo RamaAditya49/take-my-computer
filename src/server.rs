@@ -3899,14 +3899,16 @@ fn is_container_role(role: &str) -> bool {
     CONTAINER_ROLES.contains(&role.as_str())
 }
 
-/// The smallest element of the snapshot whose bounds hold the desktop point.
-/// A deeper element wins a tie, because it is the more specific control. The
-/// snapshot root does not count. A container role still wins when it is the
-/// smallest element, because web pages make clickable controls from generic
-/// containers; a larger ancestor never replaces it. An unnamed container does
-/// not say what is under the point, so the point stays unresolved.
+/// The element of the snapshot that rates a click at the desktop point.
+/// The snapshot root does not count. Every other element whose bounds hold
+/// the point counts, also a container, because web pages make clickable
+/// controls from generic containers. If one of them has a commit word, the
+/// smallest such element wins, so neither a child label nor a parent hides
+/// a "Send" button. Otherwise the smallest element wins, and a deeper element
+/// wins a tie. An unnamed container does not say what is under the point, so
+/// then the point stays unresolved.
 fn smallest_node_at(nodes: &[AccessibilityNode], x: i32, y: i32) -> Option<&AccessibilityNode> {
-    let node = nodes
+    let mut hits: Vec<_> = nodes
         .iter()
         .filter(|node| node.parent_index.is_some())
         .filter_map(|node| {
@@ -3927,8 +3929,16 @@ fn smallest_node_at(nodes: &[AccessibilityNode], x: i32, y: i32) -> Option<&Acce
                 ((area, std::cmp::Reverse(node.depth), node.index), node)
             })
         })
-        .min_by_key(|(key, _)| *key)
-        .map(|(_, node)| node)?;
+        .collect();
+    hits.sort_by_key(|(key, _)| *key);
+    let text_of = |text: &Option<String>| text.as_deref().unwrap_or("").to_string();
+    if let Some((_, node)) = hits.iter().find(|(_, node)| {
+        crate::policy::commit_word(&text_of(&node.name)).is_some()
+            || crate::policy::commit_word(&text_of(&node.description)).is_some()
+    }) {
+        return Some(node);
+    }
+    let (_, node) = hits.first()?;
     let has_text = |text: &Option<String>| text.as_deref().is_some_and(|t| !t.trim().is_empty());
     if is_container_role(&node.role) && !has_text(&node.name) && !has_text(&node.description) {
         return None;
@@ -8701,6 +8711,19 @@ printf '%s %s\n' "${0##*/}" "$*" >> "$CUL_POINTER_TEST_LOG"
                 role_node(2, "", role, bounds(0, 0, 10, 10)),
             ];
             assert!(smallest_node_at(&unnamed_inside, 5, 5).is_none(), "{role}");
+            // A child label or an unnamed container does not hide a parent
+            // control with a commit word.
+            for child in ["", "Label"] {
+                let under_send = [
+                    named_node(1, "Send", bounds(0, 0, 100, 100)),
+                    role_node(2, child, role, bounds(0, 0, 10, 10)),
+                ];
+                assert_eq!(
+                    smallest_node_at(&under_send, 5, 5).and_then(|node| node.name.as_deref()),
+                    Some("Send"),
+                    "{role} {child:?}"
+                );
+            }
         }
         // Roles of real controls still count.
         for role in [

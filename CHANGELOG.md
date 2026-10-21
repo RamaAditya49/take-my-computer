@@ -20,7 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Treat `Ctrl+M` and `Ctrl+J` as Enter, with any extra modifiers. In a terminal, treat `Ctrl+O` as Enter too. The same Enter rules apply.
 - Split the `run_shell` confirmation on every Unicode line break: LF, CR, NEL, vertical tab, form feed, line separator, and paragraph separator. Show every other control character and every format character as a `\u{XXXX}` escape. Normal text stays as it is.
 - Refuse every `press_key` into a known password field in `confirm` mode, except Tab, ISO_Left_Tab, Escape, BackSpace, Delete, the arrow keys, Home, End, Return, KP_Enter, Enter, and chords of these keys with Shift only. This replaces the rule for one printable character.
-- Use the hit test of a coordinate `click` only when the snapshot belongs to the target window or to the focused window, and is younger than 30 seconds. Skip the snapshot root. Keep the smallest element under the point, also when it has a container role. An unnamed container leaves the point unresolved. An unknown window pid also leaves the point unresolved.
+- Use the hit test of a coordinate `click` only when the snapshot belongs to the target window or to the focused window, and is younger than 30 seconds. Skip the snapshot root. Check every element under the point, also a container. An element with a commit word wins. Otherwise the smallest element wins. An unnamed container leaves the point unresolved. An unknown window pid also leaves the point unresolved.
 
 ### Documentation
 
