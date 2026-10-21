@@ -142,7 +142,16 @@ pub enum ScrollDirection {
     Right,
 }
 
-pub async fn start_portal_pointer_session() -> Result<PortalPointerSession> {
+/// A portal session that a call has just started.
+pub struct StartedPortalSession<S> {
+    pub session: S,
+    /// A saved grant restored the session, so the user saw no permission
+    /// dialog. When this is false, the user just answered a dialog and the
+    /// focus may have moved while it was open.
+    pub restored_grant: bool,
+}
+
+pub async fn start_portal_pointer_session() -> Result<StartedPortalSession<PortalPointerSession>> {
     hydrate_session_bus_env();
 
     let connection = Connection::session()
@@ -150,6 +159,7 @@ pub async fn start_portal_pointer_session() -> Result<PortalPointerSession> {
         .context("failed to connect to session bus for remote desktop portal")?;
     let persistence = remote_desktop_persistence(&connection).await;
     let permit = claim_restore_permit(&persistence, PortalDeviceKind::Pointer).await;
+    let restored_grant = permit_restores_grant(permit.as_ref());
     let session_handle = create_remote_desktop_session(&connection).await?;
     let mut cleanup = PortalSessionCleanup::new(connection.clone(), session_handle.clone());
     select_pointer_devices(&connection, &session_handle, permit.as_ref()).await?;
@@ -180,17 +190,21 @@ pub async fn start_portal_pointer_session() -> Result<PortalPointerSession> {
     }
     cleanup.disarm();
 
-    Ok(PortalPointerSession {
-        connection,
-        session_handle,
-        streams,
-        desktop_layout,
-        input_lock: portal_input_lock(),
-        valid: Arc::new(AtomicBool::new(true)),
+    Ok(StartedPortalSession {
+        session: PortalPointerSession {
+            connection,
+            session_handle,
+            streams,
+            desktop_layout,
+            input_lock: portal_input_lock(),
+            valid: Arc::new(AtomicBool::new(true)),
+        },
+        restored_grant,
     })
 }
 
-pub async fn start_portal_keyboard_session() -> Result<PortalKeyboardSession> {
+pub async fn start_portal_keyboard_session() -> Result<StartedPortalSession<PortalKeyboardSession>>
+{
     hydrate_session_bus_env();
 
     let connection = Connection::session()
@@ -198,6 +212,7 @@ pub async fn start_portal_keyboard_session() -> Result<PortalKeyboardSession> {
         .context("failed to connect to session bus for remote desktop portal")?;
     let persistence = remote_desktop_persistence(&connection).await;
     let permit = claim_restore_permit(&persistence, PortalDeviceKind::Keyboard).await;
+    let restored_grant = permit_restores_grant(permit.as_ref());
     let session_handle = create_remote_desktop_session(&connection).await?;
     let mut cleanup = PortalSessionCleanup::new(connection.clone(), session_handle.clone());
     select_keyboard_devices(&connection, &session_handle, permit.as_ref()).await?;
@@ -211,11 +226,14 @@ pub async fn start_portal_keyboard_session() -> Result<PortalKeyboardSession> {
     }
     cleanup.disarm();
 
-    Ok(PortalKeyboardSession {
-        connection,
-        session_handle,
-        input_lock: portal_input_lock(),
-        valid: Arc::new(AtomicBool::new(true)),
+    Ok(StartedPortalSession {
+        session: PortalKeyboardSession {
+            connection,
+            session_handle,
+            input_lock: portal_input_lock(),
+            valid: Arc::new(AtomicBool::new(true)),
+        },
+        restored_grant,
     })
 }
 
@@ -1270,6 +1288,14 @@ fn device_select_persistence(
             .filter(|token| acceptable_restore_token(token))
             .map(ToString::to_string),
     }
+}
+
+/// True when the permit holds a saved grant that the portal can restore. The
+/// portal then starts the session with no permission dialog.
+fn permit_restores_grant(permit: Option<&RestorePermit>) -> bool {
+    device_select_persistence(permit.is_some(), permit.and_then(RestorePermit::token))
+        .restore_token
+        .is_some()
 }
 
 fn acceptable_restore_token(token: &str) -> bool {
@@ -2874,6 +2900,26 @@ mod tests {
         assert_eq!(keyboard.token(), Some("keyboard-token"));
         keyboard.commit(ParsedRestoreToken::Rejected).unwrap();
         assert!(!keyboard_path.exists());
+    }
+
+    #[test]
+    fn a_session_counts_as_restored_only_when_the_permit_holds_a_token() {
+        // Persistence is off, so no permit exists and the portal asks.
+        assert!(!permit_restores_grant(None));
+
+        let dir = TempState::new();
+        let first = RestorePermit::acquire_in(&dir.path, PortalDeviceKind::Pointer).unwrap();
+        assert!(!permit_restores_grant(Some(&first)), "no saved grant yet");
+        first
+            .commit(ParsedRestoreToken::Usable("pointer-token".to_string()))
+            .unwrap();
+
+        let pointer = RestorePermit::acquire_in(&dir.path, PortalDeviceKind::Pointer).unwrap();
+        assert!(permit_restores_grant(Some(&pointer)));
+        drop(pointer);
+        // The keyboard has its own grant.
+        let keyboard = RestorePermit::acquire_in(&dir.path, PortalDeviceKind::Keyboard).unwrap();
+        assert!(!permit_restores_grant(Some(&keyboard)));
     }
 
     #[test]

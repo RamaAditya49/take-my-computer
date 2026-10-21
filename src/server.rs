@@ -1198,7 +1198,11 @@ impl ComputerUseLinux {
             }
         } else if self.should_prefer_portal_pointer_backend().await {
             match self.ensure_portal_pointer_session().await {
-                Ok(Some(session)) => {
+                Ok(Some(ensured)) => {
+                    if ensured.hold_input {
+                        return Json(held_after_consent_output("click", received));
+                    }
+                    let session = ensured.session;
                     let Some((portal_x, portal_y)) =
                         portal_target_point.or_else(|| self.logical_portal_point(&session, x, y))
                     else {
@@ -1765,7 +1769,11 @@ impl ComputerUseLinux {
             }
         } else if self.should_prefer_portal_pointer_backend().await {
             match self.ensure_portal_pointer_session().await {
-                Ok(Some(session)) => {
+                Ok(Some(ensured)) => {
+                    if ensured.hold_input {
+                        return Json(held_after_consent_output("scroll", received));
+                    }
+                    let session = ensured.session;
                     let mapped_target = match (portal_target_point, target_point) {
                         (Some(point), _) => Some(Some(point)),
                         (None, Some((x, y))) => self.logical_portal_point(&session, x, y).map(Some),
@@ -1974,7 +1982,11 @@ impl ComputerUseLinux {
         } else if self.should_prefer_portal_pointer_backend().await {
             let _ = self.capture_space_rect().await;
             match self.ensure_portal_pointer_session().await {
-                Ok(Some(session)) => {
+                Ok(Some(ensured)) => {
+                    if ensured.hold_input {
+                        return Json(held_after_consent_output("drag", received));
+                    }
+                    let session = ensured.session;
                     let Some((start_x, start_y)) =
                         self.logical_portal_point(&session, params.start_x, params.start_y)
                     else {
@@ -2100,7 +2112,11 @@ impl ComputerUseLinux {
         self.indicator.keys(&params.key, secret).await;
         if self.should_prefer_portal_keyboard_for_chords().await {
             match self.ensure_portal_keyboard_session().await {
-                Ok(Some(session)) => {
+                Ok(Some(ensured)) => {
+                    if ensured.hold_input {
+                        return Json(held_after_consent_output("press_key", received));
+                    }
+                    let session = ensured.session;
                     // KDE keeps physical keycodes: its keysym path is untested
                     // here, and #191 was reported against mutter.
                     let (modifiers, key) = portal_key_chord(&params.key)
@@ -2341,7 +2357,11 @@ impl ComputerUseLinux {
         self.indicator.text("type_text", &params.text, secret).await;
         if self.should_prefer_kde_clipboard_text_backend() {
             match self.ensure_portal_keyboard_session().await {
-                Ok(Some(session)) => {
+                Ok(Some(ensured)) => {
+                    if ensured.hold_input {
+                        return Json(held_after_consent_output("type_text", received));
+                    }
+                    let session = ensured.session;
                     let kde_focus = if window_target.has_target() {
                         match self.focus_target_for_input(&window_target).await {
                             Ok(focus) => focus,
@@ -2403,13 +2423,17 @@ impl ComputerUseLinux {
                         .await
                         .map_err(|error| format!("Literal text was not sent: {error:#}"))?;
                 }
-                let session = self
+                let ensured = self
                     .ensure_portal_keyboard_session()
                     .await
                     .map_err(|error| format!("Portal text input could not start: {error:#}"))?
                     .ok_or_else(|| {
                         "Portal keyboard input is unavailable; no text was sent.".to_string()
                     })?;
+                if ensured.hold_input {
+                    return Err(FRESH_CONSENT_MESSAGE.to_string());
+                }
+                let session = ensured.session;
                 type_text_with_keysyms(&session, &keysyms)
                     .await
                     .map_err(|error| {
@@ -4444,46 +4468,74 @@ impl ComputerUseLinux {
         }
     }
 
-    async fn ensure_portal_pointer_session(&self) -> Result<Option<PortalPointerSession>> {
+    async fn ensure_portal_pointer_session(
+        &self,
+    ) -> Result<Option<EnsuredPortalSession<PortalPointerSession>>> {
         if !self.should_prefer_portal_pointer_backend().await {
             return Ok(None);
         }
         if let Some(session) = self.cached_portal_pointer_session() {
-            return Ok(Some(session));
+            return Ok(Some(EnsuredPortalSession::new(
+                session,
+                PortalSessionSource::Cached,
+            )));
         }
 
         let _guard = self.portal_session_init_lock.lock().await;
         if let Some(session) = self.cached_portal_pointer_session() {
-            return Ok(Some(session));
+            return Ok(Some(EnsuredPortalSession::new(
+                session,
+                PortalSessionSource::Cached,
+            )));
         }
 
-        let session = start_portal_pointer_session().await?;
+        let started = start_portal_pointer_session().await?;
+        // The session stays in the cache, so the next call sends at once.
         if let Ok(mut cached) = self.portal_pointer_session.lock() {
-            *cached = Some(session.clone());
+            *cached = Some(started.session.clone());
         }
-        Ok(Some(session))
+        Ok(Some(EnsuredPortalSession::new(
+            started.session,
+            PortalSessionSource::Started {
+                restored_grant: started.restored_grant,
+            },
+        )))
     }
 
-    async fn ensure_portal_keyboard_session(&self) -> Result<Option<PortalKeyboardSession>> {
+    async fn ensure_portal_keyboard_session(
+        &self,
+    ) -> Result<Option<EnsuredPortalSession<PortalKeyboardSession>>> {
         if env_flag_enabled("COMPUTER_USE_LINUX_FORCE_YDOTOOL_KEYBOARD")
             || !self.is_wayland_session()
         {
             return Ok(None);
         }
         if let Some(session) = self.cached_portal_keyboard_session() {
-            return Ok(Some(session));
+            return Ok(Some(EnsuredPortalSession::new(
+                session,
+                PortalSessionSource::Cached,
+            )));
         }
 
         let _guard = self.portal_session_init_lock.lock().await;
         if let Some(session) = self.cached_portal_keyboard_session() {
-            return Ok(Some(session));
+            return Ok(Some(EnsuredPortalSession::new(
+                session,
+                PortalSessionSource::Cached,
+            )));
         }
 
-        let session = start_portal_keyboard_session().await?;
+        let started = start_portal_keyboard_session().await?;
+        // The session stays in the cache, so the next call sends at once.
         if let Ok(mut cached) = self.portal_keyboard_session.lock() {
-            *cached = Some(session.clone());
+            *cached = Some(started.session.clone());
         }
-        Ok(Some(session))
+        Ok(Some(EnsuredPortalSession::new(
+            started.session,
+            PortalSessionSource::Started {
+                restored_grant: started.restored_grant,
+            },
+        )))
     }
 
     async fn resolve_window_context(
@@ -6529,6 +6581,57 @@ fn unsafe_pointer_fallback(action: &str, received: Option<serde_json::Value>) ->
         implemented: true,
         action: action.to_string(),
         message: "Coordinate input was not sent: ydotool cannot position the pointer accurately on Wayland. Enable the uinput absolute pointer with working screenshot capture, or use COMPUTER_USE_LINUX_FORCE_PORTAL_POINTER=1 with an approved desktop portal session. Remove COMPUTER_USE_LINUX_FORCE_YDOTOOL_POINTER if set.".to_string(),
+        received,
+    }
+}
+
+/// Message for an input call that a new permission dialog held back.
+const FRESH_CONSENT_MESSAGE: &str = "Input permission is now granted. The permission dialog may have moved the focus. Look at the screen again, then send the input again.";
+
+/// Where the portal session of one input call came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PortalSessionSource {
+    /// The server already held the session.
+    Cached,
+    /// The call started the session. `restored_grant` is true when a saved
+    /// grant restored it, so the user saw no permission dialog.
+    Started { restored_grant: bool },
+}
+
+/// True when the call must not send input yet. The call started a session
+/// without a saved grant, so the user just answered a permission dialog. The
+/// dialog may have moved the focus to another window.
+fn hold_input_after_consent(source: PortalSessionSource) -> bool {
+    matches!(
+        source,
+        PortalSessionSource::Started {
+            restored_grant: false
+        }
+    )
+}
+
+/// A portal session for one input call, and whether the call holds its input.
+struct EnsuredPortalSession<S> {
+    session: S,
+    hold_input: bool,
+}
+
+impl<S> EnsuredPortalSession<S> {
+    fn new(session: S, source: PortalSessionSource) -> Self {
+        Self {
+            session,
+            hold_input: hold_input_after_consent(source),
+        }
+    }
+}
+
+/// The result of an input call that sent nothing after a new permission dialog.
+fn held_after_consent_output(action: &str, received: Option<serde_json::Value>) -> ActionOutput {
+    ActionOutput {
+        ok: false,
+        implemented: true,
+        action: action.to_string(),
+        message: FRESH_CONSENT_MESSAGE.to_string(),
         received,
     }
 }
@@ -8954,6 +9057,62 @@ printf '%s %s\n' "${0##*/}" "$*" >> "$CUL_POINTER_TEST_LOG"
         server.clear_cached_nodes();
         let third = server.snapshot_generation();
         assert!(first < second && second < third, "{first} {second} {third}");
+    }
+
+    #[test]
+    fn input_is_held_only_after_a_new_permission_dialog() {
+        use PortalSessionSource::{Cached, Started};
+        // The server already held the session: no dialog, so send.
+        assert!(!hold_input_after_consent(Cached));
+        // A saved grant restored the session: no dialog, so send.
+        assert!(!hold_input_after_consent(Started {
+            restored_grant: true
+        }));
+        // The user just answered a dialog: the focus may have moved, so hold.
+        assert!(hold_input_after_consent(Started {
+            restored_grant: false
+        }));
+    }
+
+    #[test]
+    fn an_ensured_session_takes_its_hold_from_its_source() {
+        use PortalSessionSource::{Cached, Started};
+        for (source, hold) in [
+            (Cached, false),
+            (
+                Started {
+                    restored_grant: true,
+                },
+                false,
+            ),
+            (
+                Started {
+                    restored_grant: false,
+                },
+                true,
+            ),
+        ] {
+            let ensured = EnsuredPortalSession::new(7_u8, source);
+            assert_eq!(ensured.hold_input, hold, "{source:?}");
+            assert_eq!(ensured.session, 7);
+        }
+    }
+
+    #[test]
+    fn a_held_input_call_returns_ok_false_with_the_next_step() {
+        let received = Some(serde_json::json!({"text": "hello"}));
+        for action in ["click", "drag", "scroll", "type_text", "press_key"] {
+            let output = held_after_consent_output(action, received.clone());
+            assert!(!output.ok, "{action}");
+            assert!(output.implemented, "{action}");
+            assert_eq!(output.action, action);
+            assert_eq!(output.message, FRESH_CONSENT_MESSAGE);
+            assert_eq!(output.received, received);
+        }
+        assert_eq!(
+            FRESH_CONSENT_MESSAGE,
+            "Input permission is now granted. The permission dialog may have moved the focus. Look at the screen again, then send the input again."
+        );
     }
 
     #[test]
