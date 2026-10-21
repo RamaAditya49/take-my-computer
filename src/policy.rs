@@ -584,50 +584,101 @@ pub(crate) fn commit_word(text: &str) -> Option<&'static str> {
         })
 }
 
-/// The key part of a chord, lowercase, without hyphens, underscores, or
-/// spaces. This follows the key grammar of `press_key`: parts join with `+`.
-fn last_key_part(key: &str) -> Option<String> {
+/// The parts of a chord as the `press_key` grammar reads them: the parts join
+/// with `+`, empty parts drop out, and each part is lowercase without
+/// hyphens, underscores, or spaces. The last part is the key.
+fn chord_parts(key: &str) -> Vec<String> {
     key.split('+')
         .map(str::trim)
-        .rfind(|part| !part.is_empty())
-        .map(|last| last.to_ascii_lowercase().replace(['-', '_', ' '], ""))
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            part.to_ascii_lowercase()
+                .replace(['-', '_'], "")
+                .split_whitespace()
+                .collect()
+        })
+        .collect()
 }
 
-/// True for Return, KP_Enter, or Enter with any modifiers. This follows the
-/// key grammar of `press_key` (parts joined with `+`, case-insensitive,
-/// hyphens and spaces ignored) and also accepts `KP_Enter` spellings.
+/// True when a modifier part is the Control key.
+fn is_control_modifier(part: &str) -> bool {
+    matches!(part, "ctrl" | "control")
+}
+
+/// True for Return, KP_Enter, or Enter with any modifiers. It is also true
+/// for `Ctrl+M` and `Ctrl+J` with any extra modifiers: a terminal reads
+/// them as a carriage return and a line feed. This follows the key grammar of
+/// `press_key` (parts joined with `+`, case-insensitive, hyphens and spaces
+/// ignored) and also accepts `KP_Enter` spellings.
 pub(crate) fn is_enter_key(key: &str) -> bool {
-    last_key_part(key).is_some_and(|last| {
-        matches!(
-            last.as_str(),
-            "enter" | "return" | "kpenter" | "numpadenter"
-        )
-    })
+    let mut parts = chord_parts(key);
+    let Some(last) = parts.pop() else {
+        return false;
+    };
+    matches!(
+        last.as_str(),
+        "enter" | "return" | "kpenter" | "numpadenter"
+    ) || (matches!(last.as_str(), "m" | "j") && parts.iter().any(|part| is_control_modifier(part)))
+}
+
+/// True for `Ctrl+O` with any extra modifiers. A shell reads it as Enter
+/// (it runs the line, then recalls the next one), so it is Enter in a
+/// terminal only. In other apps it is "open".
+pub(crate) fn is_terminal_enter_key(key: &str) -> bool {
+    let mut parts = chord_parts(key);
+    parts.pop().is_some_and(|last| last == "o")
+        && parts.iter().any(|part| is_control_modifier(part))
 }
 
 /// True for the space key with any modifiers. Space presses the focused
 /// button, link, or checkbox.
 pub(crate) fn is_space_key(key: &str) -> bool {
-    last_key_part(key).is_some_and(|last| last == "space")
+    chord_parts(key).pop().is_some_and(|last| last == "space")
 }
 
-/// True when the key part is one printable character, such as `a` or `7`,
-/// with any modifiers. An agent can send a password this way, key by key.
-pub(crate) fn is_single_printable_key(key: &str) -> bool {
-    key.split('+')
-        .map(str::trim)
-        .rfind(|part| !part.is_empty())
-        .is_some_and(|last| {
-            let mut chars = last.chars();
-            matches!((chars.next(), chars.next()), (Some(c), None) if c.is_alphanumeric())
-        })
+/// Keys that cannot type a character: navigation, editing, and Enter. They
+/// stay allowed in a password field.
+const PASSWORD_SAFE_KEYS: [&str; 21] = [
+    "tab",
+    "isolefttab",
+    "escape",
+    "esc",
+    "backspace",
+    "delete",
+    "del",
+    "left",
+    "right",
+    "up",
+    "down",
+    "arrowleft",
+    "arrowright",
+    "arrowup",
+    "arrowdown",
+    "home",
+    "end",
+    "return",
+    "enter",
+    "kpenter",
+    "numpadenter",
+];
+
+/// True when the key cannot type a character into a password field: a key
+/// from [`PASSWORD_SAFE_KEYS`], alone or with Shift only. Any other key can
+/// type or paste, so an agent could send a password with it.
+pub(crate) fn is_password_safe_key(key: &str) -> bool {
+    let mut parts = chord_parts(key);
+    let Some(last) = parts.pop() else {
+        return false;
+    };
+    parts.iter().all(|part| part == "shift") && PASSWORD_SAFE_KEYS.contains(&last.as_str())
 }
 
-/// True when the gate needs the focused element to rate this key: Enter and
-/// space can press a focused control, and a single character can type into a
-/// password field.
+/// True when the gate needs the focused element to rate this key. Enter and
+/// space can press a focused control. Every key that is not password-safe
+/// can type into a password field, so it needs the role of the focus.
 pub(crate) fn key_needs_focus_check(key: &str) -> bool {
-    is_enter_key(key) || is_space_key(key) || is_single_printable_key(key)
+    !chord_parts(key).is_empty()
+        && (is_enter_key(key) || is_space_key(key) || !is_password_safe_key(key))
 }
 
 /// The list entry that matches the window, if any. Entries are lowercase
@@ -761,10 +812,15 @@ pub(crate) fn classify(facts: &ActionFacts, lists: &AppLists) -> Classification 
             };
             // The role check fails open: with no accessibility data the
             // role is unknown, and the key goes through.
-            if is_single_printable_key(key) && facts.element_is_password() {
+            if facts.element_is_password() && !is_password_safe_key(key) {
                 return Classification::blocked(Reason::PasswordField);
             }
-            if is_enter_key(key) {
+            // Ctrl+O is Enter in a terminal. An unknown window may be one.
+            let enters = is_enter_key(key)
+                || (is_terminal_enter_key(key)
+                    && (terminal_app_match(facts, &lists.terminal).is_some()
+                        || !facts.has_window()));
+            if enters {
                 if let Some(rating) = enter_rating(
                     facts,
                     lists,
@@ -1782,6 +1838,87 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_m_and_ctrl_j_are_enter_with_any_modifier_case_and_spacing() {
+        for key in [
+            "Ctrl+M",
+            "ctrl+m",
+            "CTRL+M",
+            "Control+m",
+            "ctrl + m",
+            "Ctrl+J",
+            "ctrl+j",
+            "CONTROL + J",
+            "Ctrl+Shift+M",
+            "Shift+Ctrl+j",
+            "Alt+Ctrl+M",
+            "Super+Ctrl+Shift+J",
+            "ctrl+alt+m",
+            "Ctrl+Ctrl+m",
+            "con-trol+m",
+            " Ctrl + m ",
+        ] {
+            assert!(is_enter_key(key), "{key}");
+        }
+    }
+
+    #[test]
+    fn ctrl_m_and_ctrl_j_need_a_focus_check_like_enter() {
+        for key in ["Ctrl+M", "Ctrl+J", "Ctrl+Shift+m"] {
+            assert!(key_needs_focus_check(key), "{key}");
+        }
+    }
+
+    #[test]
+    fn other_control_chords_are_not_enter() {
+        for key in [
+            "Ctrl+C",
+            "Ctrl+Shift+C",
+            "Ctrl+K",
+            "Ctrl+L",
+            "Ctrl+Shift+N",
+            "Ctrl+O",
+            "Alt+M",
+            "Shift+J",
+            "Super+m",
+            "m",
+            "j",
+            "M",
+            "J",
+            "Ctrl",
+            "Ctrl+Tab",
+            "m+Ctrl",
+        ] {
+            assert!(!is_enter_key(key), "{key}");
+        }
+    }
+
+    #[test]
+    fn ctrl_o_is_the_terminal_enter_chord() {
+        for key in [
+            "Ctrl+O",
+            "ctrl+o",
+            "Control + o",
+            "Ctrl+Shift+O",
+            "Alt+Ctrl+o",
+        ] {
+            assert!(is_terminal_enter_key(key), "{key}");
+        }
+        for key in [
+            "o",
+            "O",
+            "Alt+O",
+            "Shift+o",
+            "Ctrl+P",
+            "Ctrl+M",
+            "Ctrl",
+            "Ctrl+o+Tab",
+            "",
+        ] {
+            assert!(!is_terminal_enter_key(key), "{key}");
+        }
+    }
+
+    #[test]
     fn other_keys_are_not_enter() {
         for key in [
             "Escape",
@@ -2109,6 +2246,110 @@ mod tests {
         assert_eq!(typed.reason, Some(Reason::NewlineInUnknownWindow));
     }
 
+    #[test]
+    fn enter_chords_follow_the_same_enter_rules() {
+        for key in ["Ctrl+M", "ctrl+j", "Ctrl+Shift+M", "Alt+Control+J"] {
+            // Terminal.
+            let cls = classify(
+                &in_window("press_key", "kitty", "kitty").with_key(key),
+                &apps(),
+            );
+            assert_eq!(cls.tier, Tier::High, "{key}");
+            assert_eq!(cls.reason, Some(Reason::EnterInTerminal), "{key}");
+            // Send-on-Enter app.
+            let cls = classify(
+                &in_window("press_key", "org.telegram.desktop", "Telegram").with_key(key),
+                &apps(),
+            );
+            assert_eq!(cls.reason, Some(Reason::EnterInSendApp), "{key}");
+            // Unknown window.
+            let cls = classify(&facts("press_key").with_key(key), &apps());
+            assert_eq!(cls.reason, Some(Reason::EnterInUnknownWindow), "{key}");
+            // Commit control.
+            let facts = in_window("press_key", "gedit", "notes")
+                .with_element(Some("push button"), Some("Send"), None)
+                .with_key(key);
+            assert_eq!(
+                classify(&facts, &apps()).reason,
+                Some(Reason::CommitWord("send")),
+                "{key}"
+            );
+            // A known, harmless window stays low.
+            let cls = classify(
+                &in_window("press_key", "gedit", "notes").with_key(key),
+                &apps(),
+            );
+            assert_eq!(cls.tier, Tier::Low, "{key}");
+        }
+    }
+
+    #[test]
+    fn other_control_chords_stay_low_in_a_terminal() {
+        for key in [
+            "Ctrl+C",
+            "Ctrl+Shift+C",
+            "Ctrl+L",
+            "Ctrl+K",
+            "Ctrl+R",
+            "Alt+M",
+        ] {
+            let cls = classify(
+                &in_window("press_key", "kitty", "kitty").with_key(key),
+                &apps(),
+            );
+            assert_eq!(cls.tier, Tier::Low, "{key}");
+        }
+    }
+
+    #[test]
+    fn ctrl_o_is_enter_in_a_terminal_and_in_an_unknown_window_only() {
+        for key in ["Ctrl+O", "ctrl+o", "Ctrl+Shift+O"] {
+            let in_terminal = classify(
+                &in_window("press_key", "kitty", "kitty").with_key(key),
+                &apps(),
+            );
+            assert_eq!(in_terminal.tier, Tier::High, "{key}");
+            assert_eq!(in_terminal.reason, Some(Reason::EnterInTerminal), "{key}");
+            // A terminal that the window title shows is found too.
+            let by_title = classify(
+                &ActionFacts::new("press_key")
+                    .with_window(None, Some("Foo"), Some("user@host: ~ - Terminal"))
+                    .with_key(key),
+                &apps(),
+            );
+            assert_eq!(by_title.reason, Some(Reason::EnterInTerminal), "{key}");
+            // The app of an unknown window may be a terminal.
+            let unknown = classify(&facts("press_key").with_key(key), &apps());
+            assert_eq!(unknown.reason, Some(Reason::EnterInUnknownWindow), "{key}");
+            // In a known app that is not a terminal, Ctrl+O is "open".
+            for (app, title) in [
+                ("gedit", "notes"),
+                ("org.telegram.desktop", "Telegram"),
+                ("firefox", "Mozilla Firefox"),
+            ] {
+                let cls = classify(&in_window("press_key", app, title).with_key(key), &apps());
+                assert_eq!(cls.tier, Tier::Low, "{app} {key}");
+            }
+        }
+        // The plain letter is never Enter.
+        let plain = classify(
+            &in_window("press_key", "kitty", "kitty").with_key("o"),
+            &apps(),
+        );
+        assert_eq!(plain.tier, Tier::Low);
+    }
+
+    #[test]
+    fn ctrl_o_on_a_commit_control_in_a_terminal_names_the_commit_word() {
+        let facts = in_window("press_key", "kitty", "kitty")
+            .with_element(Some("terminal"), Some("Send"), None)
+            .with_key("Ctrl+O");
+        assert_eq!(
+            classify(&facts, &apps()).reason,
+            Some(Reason::CommitWord("send"))
+        );
+    }
+
     // ----- keyboard activation of a control -----
 
     #[test]
@@ -2187,7 +2428,7 @@ mod tests {
     }
 
     #[test]
-    fn key_focus_check_covers_enter_space_and_single_characters() {
+    fn key_focus_check_covers_enter_space_and_every_key_that_can_type() {
         for key in [
             "Enter",
             "Return",
@@ -2196,10 +2437,27 @@ mod tests {
             "7",
             "Ctrl+a",
             "Shift+Return",
+            "F5",
+            "Ctrl",
+            "Ctrl+Shift+Tab",
+            "Ctrl+Tab",
+            "Ctrl+V",
+            "Ctrl+O",
+            "PageDown",
         ] {
             assert!(key_needs_focus_check(key), "{key}");
         }
-        for key in ["Tab", "Escape", "F5", "Up", "Ctrl", "Ctrl+Shift+Tab", ""] {
+        for key in [
+            "Tab",
+            "Escape",
+            "Up",
+            "Shift+Tab",
+            "ISO_Left_Tab",
+            "BackSpace",
+            "Shift+Left",
+            "",
+            "+",
+        ] {
             assert!(!key_needs_focus_check(key), "{key}");
         }
     }
@@ -2207,20 +2465,82 @@ mod tests {
     // ----- password field by single keys -----
 
     #[test]
-    fn single_printable_keys_are_recognised() {
-        for key in ["a", "Z", "7", "Shift+a", "Ctrl+7"] {
-            assert!(is_single_printable_key(key), "{key}");
+    fn password_safe_keys_are_recognised() {
+        for key in [
+            "Tab",
+            "tab",
+            "ISO_Left_Tab",
+            "iso-left-tab",
+            "Escape",
+            "Esc",
+            "BackSpace",
+            "Delete",
+            "Left",
+            "Right",
+            "Up",
+            "Down",
+            "ArrowLeft",
+            "Home",
+            "End",
+            "Return",
+            "KP_Enter",
+            "Enter",
+            "Shift+Tab",
+            "shift + Left",
+            "Shift+Shift+Home",
+            "Shift+End",
+            "Shift+Return",
+        ] {
+            assert!(is_password_safe_key(key), "{key}");
         }
         for key in [
-            "Enter", "Tab", "F5", "Space", "Ctrl", "ab", "", "+", "Ctrl+Tab",
+            "a",
+            "Z",
+            "7",
+            "Shift+a",
+            "Space",
+            "Shift+Space",
+            "F5",
+            "PageUp",
+            "Ctrl",
+            "Shift",
+            "Ctrl+Tab",
+            "Ctrl+Left",
+            "Alt+Tab",
+            "Super+Up",
+            "Ctrl+V",
+            "Ctrl+M",
+            "Ctrl+Shift+Left",
+            "Tab+Tab",
+            "Entertain",
+            "",
+            "+",
         ] {
-            assert!(!is_single_printable_key(key), "{key}");
+            assert!(!is_password_safe_key(key), "{key}");
         }
     }
 
     #[test]
-    fn single_keys_in_a_password_field_are_blocked() {
-        for key in ["a", "7", "Shift+a"] {
+    fn typing_keys_in_a_password_field_are_blocked() {
+        for key in [
+            "a",
+            "7",
+            "Shift+a",
+            "Z",
+            "space",
+            "Shift+Space",
+            "F5",
+            "PageDown",
+            "Ctrl+V",
+            "Ctrl+a",
+            "Ctrl+Tab",
+            "Alt+Left",
+            "Ctrl+M",
+            "Ctrl+J",
+            "Ctrl+Shift+Enter",
+            "Ctrl+Enter",
+            "Super",
+        ] {
             let facts = in_window("press_key", "firefox", "Login")
                 .with_element(Some("password text"), Some("Password"), None)
                 .with_key(key);
@@ -2231,12 +2551,44 @@ mod tests {
     }
 
     #[test]
-    fn named_keys_in_a_password_field_are_not_blocked() {
-        for key in ["Tab", "Escape", "Backspace", "Ctrl+Tab"] {
+    fn the_allowed_keys_in_a_password_field_are_not_blocked() {
+        for key in [
+            "Tab",
+            "ISO_Left_Tab",
+            "Shift+Tab",
+            "Escape",
+            "Backspace",
+            "Delete",
+            "Left",
+            "Right",
+            "Up",
+            "Down",
+            "Home",
+            "End",
+            "Shift+Left",
+            "Shift+End",
+        ] {
             let facts = in_window("press_key", "firefox", "Login")
                 .with_element(Some("password text"), Some("Password"), None)
                 .with_key(key);
             assert_eq!(classify(&facts, &apps()).tier, Tier::Low, "{key}");
+        }
+    }
+
+    #[test]
+    fn enter_in_a_password_field_follows_the_enter_rules() {
+        for key in ["Return", "KP_Enter", "Enter", "Shift+Return"] {
+            // A known window that is not special: Enter submits the form.
+            let plain = in_window("press_key", "firefox", "Login")
+                .with_element(Some("password text"), Some("Password"), None)
+                .with_key(key);
+            assert_eq!(classify(&plain, &apps()).tier, Tier::Low, "{key}");
+            // A terminal still rates Enter high, never blocked.
+            let terminal = in_window("press_key", "kitty", "kitty")
+                .with_element(Some("password text"), Some("Password"), None)
+                .with_key(key);
+            let cls = classify(&terminal, &apps());
+            assert_eq!(cls.reason, Some(Reason::EnterInTerminal), "{key}");
         }
     }
 
@@ -2249,6 +2601,10 @@ mod tests {
             .with_element(Some("text"), Some("Password hint"), None)
             .with_key("a");
         assert_eq!(classify(&other_role, &apps()).tier, Tier::Low);
+        for key in ["space", "F5", "Ctrl+V", "Shift+a"] {
+            let unknown = in_window("press_key", "firefox", "Login").with_key(key);
+            assert_eq!(classify(&unknown, &apps()).tier, Tier::Low, "{key}");
+        }
     }
 
     #[test]
@@ -2373,6 +2729,133 @@ mod tests {
             !text.contains('\u{1b}') && !text.contains('\u{202e}'),
             "{text}"
         );
+    }
+
+    #[test]
+    fn every_unicode_line_break_starts_a_new_line_in_the_command() {
+        for (name, brk) in [
+            ("LF", "\n"),
+            ("CR", "\r"),
+            ("CRLF", "\r\n"),
+            ("NEL", "\u{0085}"),
+            ("LS", "\u{2028}"),
+            ("PS", "\u{2029}"),
+            ("VT", "\u{000b}"),
+            ("FF", "\u{000c}"),
+        ] {
+            let command = format!("echo one{brk}echo two");
+            assert_eq!(
+                command_display_lines(&command),
+                vec!["echo one".to_string(), "echo two".to_string()],
+                "{name}"
+            );
+            let facts = ActionFacts::new("run_shell").with_command(&format!(
+                "echo hi{brk}Why: harmless{brk}Allow this action? yes"
+            ));
+            let text = prompt_text("agent", &facts, &classify(&facts, &apps()));
+            for line in text.lines() {
+                assert!(
+                    !line.starts_with("Why: harmless")
+                        && !line.starts_with("Allow this action? yes"),
+                    "{name}: {text}"
+                );
+            }
+            assert_eq!(
+                text.lines().filter(|l| l.starts_with("Why:")).count(),
+                1,
+                "{name}"
+            );
+            assert!(
+                text.contains("> echo hi\n> Why: harmless\n> Allow this action? yes"),
+                "{name}: {text}"
+            );
+            for c in text.chars() {
+                assert!(
+                    c == '\n' || !(c.is_control() || is_line_break_char(c)),
+                    "{name}: U+{:04X} in {text}",
+                    c as u32
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_line_break_pair_other_than_crlf_makes_two_breaks() {
+        assert_eq!(command_display_lines("a\n\rb"), vec!["a", "", "b"]);
+        assert_eq!(command_display_lines("a\r\r\nb"), vec!["a", "", "b"]);
+        assert_eq!(
+            command_display_lines("a\u{2028}\u{2029}b"),
+            vec!["a", "", "b"]
+        );
+        assert_eq!(command_display_lines(""), vec![""]);
+        assert_eq!(command_display_lines("a\n"), vec!["a", ""]);
+    }
+
+    #[test]
+    fn control_and_format_characters_show_as_escapes_in_the_command() {
+        let escaped = [
+            ('\u{0000}', "\\u{0000}"),
+            ('\u{0007}', "\\u{0007}"),
+            ('\u{0008}', "\\u{0008}"),
+            ('\t', "\\u{0009}"),
+            ('\u{001b}', "\\u{001b}"),
+            ('\u{007f}', "\\u{007f}"),
+            ('\u{0080}', "\\u{0080}"),
+            ('\u{009f}', "\\u{009f}"),
+            ('\u{00ad}', "\\u{00ad}"),
+            ('\u{061c}', "\\u{061c}"),
+            ('\u{180e}', "\\u{180e}"),
+            ('\u{200b}', "\\u{200b}"),
+            ('\u{200e}', "\\u{200e}"),
+            ('\u{202a}', "\\u{202a}"),
+            ('\u{202e}', "\\u{202e}"),
+            ('\u{2060}', "\\u{2060}"),
+            ('\u{2066}', "\\u{2066}"),
+            ('\u{2069}', "\\u{2069}"),
+            ('\u{206f}', "\\u{206f}"),
+            ('\u{feff}', "\\u{feff}"),
+            ('\u{fff9}', "\\u{fff9}"),
+            ('\u{e0001}', "\\u{e0001}"),
+            ('\u{e0041}', "\\u{e0041}"),
+            ('\u{e007f}', "\\u{e007f}"),
+        ];
+        for (c, shown) in escaped {
+            let lines = command_display_lines(&format!("a{c}b"));
+            assert_eq!(lines, vec![format!("a{shown}b")], "U+{:04X}", c as u32);
+        }
+    }
+
+    #[test]
+    fn normal_text_in_the_command_shows_as_it_is() {
+        for command in [
+            "echo 'Halo, apa kabar? Terima kasih banyak.'",
+            "echo 'こんにちは 世界' > catatan.txt",
+            "mv café.txt «naïve».txt",
+            "echo 'Привет' | tee \"файл\"",
+            "echo 😀 > emoji.txt",
+            "grep -r 'ñ' ~/proyek",
+            "echo \u{00a0}spasi\u{3000}lebar",
+        ] {
+            assert_eq!(
+                command_display_lines(command),
+                vec![command.to_string()],
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_characters_are_not_format_characters() {
+        // A letter, a digit, a space, and non-ASCII text are not hidden.
+        for c in [
+            'a', 'Z', '0', ' ', 'é', 'あ', '日', '😀', '\u{00a0}', '\u{3000}',
+        ] {
+            assert!(!is_format_char(c), "U+{:04X}", c as u32);
+            assert!(!c.is_control(), "U+{:04X}", c as u32);
+        }
+        for c in ['\u{200b}', '\u{061c}', '\u{180e}', '\u{e0020}'] {
+            assert!(is_format_char(c), "U+{:04X}", c as u32);
+        }
     }
 
     #[test]
@@ -2534,133 +3017,6 @@ mod tests {
             );
         }
         assert_eq!(text.lines().filter(|l| l.starts_with("Why:")).count(), 1);
-    }
-
-    #[test]
-    fn every_unicode_line_break_starts_a_new_line_in_the_command() {
-        for (name, brk) in [
-            ("LF", "\n"),
-            ("CR", "\r"),
-            ("CRLF", "\r\n"),
-            ("NEL", "\u{0085}"),
-            ("LS", "\u{2028}"),
-            ("PS", "\u{2029}"),
-            ("VT", "\u{000b}"),
-            ("FF", "\u{000c}"),
-        ] {
-            let command = format!("echo one{brk}echo two");
-            assert_eq!(
-                command_display_lines(&command),
-                vec!["echo one".to_string(), "echo two".to_string()],
-                "{name}"
-            );
-            let facts = ActionFacts::new("run_shell").with_command(&format!(
-                "echo hi{brk}Why: harmless{brk}Allow this action? yes"
-            ));
-            let text = prompt_text("agent", &facts, &classify(&facts, &apps()));
-            for line in text.lines() {
-                assert!(
-                    !line.starts_with("Why: harmless")
-                        && !line.starts_with("Allow this action? yes"),
-                    "{name}: {text}"
-                );
-            }
-            assert_eq!(
-                text.lines().filter(|l| l.starts_with("Why:")).count(),
-                1,
-                "{name}"
-            );
-            assert!(
-                text.contains("> echo hi\n> Why: harmless\n> Allow this action? yes"),
-                "{name}: {text}"
-            );
-            for c in text.chars() {
-                assert!(
-                    c == '\n' || !(c.is_control() || is_line_break_char(c)),
-                    "{name}: U+{:04X} in {text}",
-                    c as u32
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn a_line_break_pair_other_than_crlf_makes_two_breaks() {
-        assert_eq!(command_display_lines("a\n\rb"), vec!["a", "", "b"]);
-        assert_eq!(command_display_lines("a\r\r\nb"), vec!["a", "", "b"]);
-        assert_eq!(
-            command_display_lines("a\u{2028}\u{2029}b"),
-            vec!["a", "", "b"]
-        );
-        assert_eq!(command_display_lines(""), vec![""]);
-        assert_eq!(command_display_lines("a\n"), vec!["a", ""]);
-    }
-
-    #[test]
-    fn control_and_format_characters_show_as_escapes_in_the_command() {
-        let escaped = [
-            ('\u{0000}', "\\u{0000}"),
-            ('\u{0007}', "\\u{0007}"),
-            ('\u{0008}', "\\u{0008}"),
-            ('\t', "\\u{0009}"),
-            ('\u{001b}', "\\u{001b}"),
-            ('\u{007f}', "\\u{007f}"),
-            ('\u{0080}', "\\u{0080}"),
-            ('\u{009f}', "\\u{009f}"),
-            ('\u{00ad}', "\\u{00ad}"),
-            ('\u{061c}', "\\u{061c}"),
-            ('\u{180e}', "\\u{180e}"),
-            ('\u{200b}', "\\u{200b}"),
-            ('\u{200e}', "\\u{200e}"),
-            ('\u{202a}', "\\u{202a}"),
-            ('\u{202e}', "\\u{202e}"),
-            ('\u{2060}', "\\u{2060}"),
-            ('\u{2066}', "\\u{2066}"),
-            ('\u{2069}', "\\u{2069}"),
-            ('\u{206f}', "\\u{206f}"),
-            ('\u{feff}', "\\u{feff}"),
-            ('\u{fff9}', "\\u{fff9}"),
-            ('\u{e0001}', "\\u{e0001}"),
-            ('\u{e0041}', "\\u{e0041}"),
-            ('\u{e007f}', "\\u{e007f}"),
-        ];
-        for (c, shown) in escaped {
-            let lines = command_display_lines(&format!("a{c}b"));
-            assert_eq!(lines, vec![format!("a{shown}b")], "U+{:04X}", c as u32);
-        }
-    }
-
-    #[test]
-    fn normal_text_in_the_command_shows_as_it_is() {
-        for command in [
-            "echo 'Halo, apa kabar? Terima kasih banyak.'",
-            "echo 'こんにちは 世界' > catatan.txt",
-            "mv café.txt «naïve».txt",
-            "echo 'Привет' | tee \"файл\"",
-            "echo 😀 > emoji.txt",
-            "grep -r 'ñ' ~/proyek",
-            "echo \u{00a0}spasi\u{3000}lebar",
-        ] {
-            assert_eq!(
-                command_display_lines(command),
-                vec![command.to_string()],
-                "{command}"
-            );
-        }
-    }
-
-    #[test]
-    fn ordinary_characters_are_not_format_characters() {
-        // A letter, a digit, a space, and non-ASCII text are not hidden.
-        for c in [
-            'a', 'Z', '0', ' ', 'é', 'あ', '日', '😀', '\u{00a0}', '\u{3000}',
-        ] {
-            assert!(!is_format_char(c), "U+{:04X}", c as u32);
-            assert!(!c.is_control(), "U+{:04X}", c as u32);
-        }
-        for c in ['\u{200b}', '\u{061c}', '\u{180e}', '\u{e0020}'] {
-            assert!(is_format_char(c), "U+{:04X}", c as u32);
-        }
     }
 
     #[test]
