@@ -142,6 +142,16 @@ pub enum ScrollDirection {
     Right,
 }
 
+/// A restored grant starts the session at once. A start that takes longer
+/// means the portal showed a dialog, for example because the saved grant was
+/// stale, and the user had to answer it.
+const SILENT_START_MAX: Duration = Duration::from_millis(1500);
+
+/// True when a saved grant restored the session without a dialog.
+fn grant_was_silent(token_present: bool, start_elapsed: Duration) -> bool {
+    token_present && start_elapsed < SILENT_START_MAX
+}
+
 /// A portal session that a call has just started.
 pub struct StartedPortalSession<S> {
     pub session: S,
@@ -159,13 +169,15 @@ pub async fn start_portal_pointer_session() -> Result<StartedPortalSession<Porta
         .context("failed to connect to session bus for remote desktop portal")?;
     let persistence = remote_desktop_persistence(&connection).await;
     let permit = claim_restore_permit(&persistence, PortalDeviceKind::Pointer).await;
-    let restored_grant = permit_restores_grant(permit.as_ref());
+    let token_present = permit_restores_grant(permit.as_ref());
     let session_handle = create_remote_desktop_session(&connection).await?;
     let mut cleanup = PortalSessionCleanup::new(connection.clone(), session_handle.clone());
     select_pointer_devices(&connection, &session_handle, permit.as_ref()).await?;
     select_monitor_sources(&connection, &session_handle).await?;
+    let start = std::time::Instant::now();
     let (devices, streams, restore_token) =
         start_remote_desktop_session(&connection, &session_handle).await?;
+    let restored_grant = grant_was_silent(token_present, start.elapsed());
     // A grant with no pointer or no monitors must not be restored. The next
     // process would skip the dialog and fail the same way.
     let restore_token = restore_token_to_keep(
@@ -212,12 +224,14 @@ pub async fn start_portal_keyboard_session() -> Result<StartedPortalSession<Port
         .context("failed to connect to session bus for remote desktop portal")?;
     let persistence = remote_desktop_persistence(&connection).await;
     let permit = claim_restore_permit(&persistence, PortalDeviceKind::Keyboard).await;
-    let restored_grant = permit_restores_grant(permit.as_ref());
+    let token_present = permit_restores_grant(permit.as_ref());
     let session_handle = create_remote_desktop_session(&connection).await?;
     let mut cleanup = PortalSessionCleanup::new(connection.clone(), session_handle.clone());
     select_keyboard_devices(&connection, &session_handle, permit.as_ref()).await?;
+    let start = std::time::Instant::now();
     let (devices, _, restore_token) =
         start_remote_desktop_session(&connection, &session_handle).await?;
+    let restored_grant = grant_was_silent(token_present, start.elapsed());
     let restore_token = restore_token_to_keep(devices & DEVICE_KEYBOARD != 0, restore_token);
     commit_restore_permit(permit, restore_token).await;
 
@@ -2900,6 +2914,14 @@ mod tests {
         assert_eq!(keyboard.token(), Some("keyboard-token"));
         keyboard.commit(ParsedRestoreToken::Rejected).unwrap();
         assert!(!keyboard_path.exists());
+    }
+
+    #[test]
+    fn a_slow_start_counts_as_a_dialog_even_with_a_saved_grant() {
+        assert!(grant_was_silent(true, Duration::from_millis(200)));
+        // A stale grant makes the portal ask again, and the user needs time.
+        assert!(!grant_was_silent(true, Duration::from_secs(4)));
+        assert!(!grant_was_silent(false, Duration::from_millis(200)));
     }
 
     #[test]

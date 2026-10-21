@@ -275,7 +275,7 @@ In `confirm` mode these actions need confirmation:
 - Coordinate clicks and password checks need accessibility data. Without it, or when the window or its focused element is unknown, the gate cannot see the control under the point or the password field. It rates the call from the facts that it knows.
 - A coordinate click needs a snapshot of the target window that is younger than 30 seconds. Take a fresh `get_app_state` before you click. With an old or foreign snapshot, or with an unknown window, the point is unresolved.
 - Without the GNOME window-targeting extension, the window is unknown. In `confirm` mode, `type_text` and `press_key` are then refused. Run `setup_window_targeting`, then pass a window target, or use `full` mode.
-- A saved grant that the desktop no longer accepts makes the portal ask again. The server cannot see that dialog, so that call sends input at once.
+- A saved grant that the desktop no longer accepts makes the portal ask again. The server cannot see that dialog directly. It counts a session start longer than 1.5 seconds as a dialog and holds the input. A user who answers within 1.5 seconds is not detected.
 - The password check reads the role of the focused element. If the role is unknown, the check allows the call. The same holds for the commit-word check of Enter and space.
 - The commit-word check of a focused element reads its name. It does not read its description.
 - For untrusted work, use `observe` mode, or run the agent under a separate user account or in a VM.
