@@ -256,6 +256,13 @@ fn resolve_state_dir(get: &impl Fn(&str) -> Option<String>) -> PathBuf {
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
         .or_else(|| non_empty(get("HOME")).map(|home| PathBuf::from(home).join(".local/state")))
+        // XDG_RUNTIME_DIR is private to the user, so it is safer than the shared temp dir.
+        .or_else(|| {
+            non_empty(get("XDG_RUNTIME_DIR"))
+                .map(PathBuf::from)
+                .filter(|path| path.is_absolute())
+                .map(|dir| dir.join("take-my-computer-state"))
+        })
         .unwrap_or_else(|| {
             // SAFETY: getuid has no preconditions and cannot fail.
             let uid = unsafe { libc::getuid() };
@@ -291,8 +298,29 @@ fn parse_terminal_apps(value: Option<&str>) -> Vec<String> {
     parse_app_list(value, &DEFAULT_TERMINAL_APPS)
 }
 
+/// Create the state directory, then check that the current user owns it and
+/// that it is not a symlink. A directory that other users can reach gets mode
+/// 0700. The check stops another user from planting the directory first, for
+/// example in the shared temp dir.
 fn ensure_dir(path: &Path) -> std::io::Result<()> {
-    DirBuilder::new().recursive(true).mode(0o700).create(path)
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    DirBuilder::new().recursive(true).mode(0o700).create(path)?;
+    let meta = std::fs::symlink_metadata(path)?;
+    // SAFETY: getuid has no preconditions and cannot fail.
+    let uid = unsafe { libc::getuid() };
+    if !meta.is_dir() || meta.uid() != uid {
+        return Err(std::io::Error::new(
+            ErrorKind::PermissionDenied,
+            format!(
+                "{} is not a directory that the current user owns",
+                path.display()
+            ),
+        ));
+    }
+    if meta.mode() & 0o077 != 0 {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
 }
 
 /// Create the kill switch file. Returns the file path.
@@ -309,6 +337,7 @@ pub(crate) fn engage_kill_switch(config: &PolicyConfig) -> Result<PathBuf> {
         .create(true)
         .truncate(true)
         .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
         .open(&path)
         .with_context(|| format!("failed to create {}", path.display()))?;
     writeln!(file, "{}", rfc3339_utc(SystemTime::now()))
@@ -995,6 +1024,7 @@ fn open_audit(config: &PolicyConfig) -> std::io::Result<File> {
         .create(true)
         .append(true)
         .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
         .open(config.audit_path())
 }
 
@@ -1074,6 +1104,7 @@ async fn acquire_input_lock(path: &Path, timeout: Duration) -> Result<InputLock,
         .create(true)
         .truncate(false)
         .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
         .open(path)
         .map_err(|error| {
             format!(
@@ -2943,6 +2974,14 @@ mod tests {
             PathBuf::from("/home/rama/.local/state/take-my-computer/input.lock")
         );
 
+        // Without HOME, the private runtime dir comes before the shared temp dir.
+        let runtime_only =
+            PolicyConfig::from_lookup(lookup(&[("XDG_RUNTIME_DIR", "/run/user/1000")]));
+        assert_eq!(
+            runtime_only.state_dir,
+            PathBuf::from("/run/user/1000/take-my-computer-state/take-my-computer")
+        );
+
         // A relative XDG_STATE_HOME is invalid per the XDG specification.
         let relative = PolicyConfig::from_lookup(lookup(&[
             ("XDG_STATE_HOME", "relative/dir"),
@@ -3094,6 +3133,40 @@ mod tests {
             let outcome = self.dialog.clone();
             Box::pin(async move { outcome })
         }
+    }
+
+    #[test]
+    fn the_state_dir_must_not_be_a_symlink() {
+        let dir = TestDir::new("symlink-state");
+        let real = dir.0.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = dir.0.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let error = ensure_dir(&link).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn an_open_state_dir_gets_mode_0700() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TestDir::new("open-state");
+        std::fs::create_dir_all(&dir.0).unwrap();
+        std::fs::set_permissions(&dir.0, std::fs::Permissions::from_mode(0o755)).unwrap();
+        ensure_dir(&dir.0).unwrap();
+        let mode = std::fs::metadata(&dir.0).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+    }
+
+    #[test]
+    fn the_audit_log_is_not_opened_through_a_symlink() {
+        let dir = TestDir::new("symlink-audit");
+        let mut config = PolicyConfig::from_lookup(|_| None);
+        config.state_dir = dir.0.join("state");
+        ensure_dir(&config.state_dir).unwrap();
+        let target = dir.0.join("elsewhere.jsonl");
+        std::os::unix::fs::symlink(&target, config.audit_path()).unwrap();
+        assert!(open_audit(&config).is_err());
+        assert!(!target.exists());
     }
 
     struct TestDir(PathBuf);
