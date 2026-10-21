@@ -1198,7 +1198,11 @@ impl ComputerUseLinux {
             }
         } else if self.should_prefer_portal_pointer_backend().await {
             match self.ensure_portal_pointer_session().await {
-                Ok(Some(session)) => {
+                Ok(Some(ensured)) => {
+                    if ensured.hold_input {
+                        return Json(held_after_consent_output("click", received));
+                    }
+                    let session = ensured.session;
                     let Some((portal_x, portal_y)) =
                         portal_target_point.or_else(|| self.logical_portal_point(&session, x, y))
                     else {
@@ -1765,7 +1769,11 @@ impl ComputerUseLinux {
             }
         } else if self.should_prefer_portal_pointer_backend().await {
             match self.ensure_portal_pointer_session().await {
-                Ok(Some(session)) => {
+                Ok(Some(ensured)) => {
+                    if ensured.hold_input {
+                        return Json(held_after_consent_output("scroll", received));
+                    }
+                    let session = ensured.session;
                     let mapped_target = match (portal_target_point, target_point) {
                         (Some(point), _) => Some(Some(point)),
                         (None, Some((x, y))) => self.logical_portal_point(&session, x, y).map(Some),
@@ -1974,7 +1982,11 @@ impl ComputerUseLinux {
         } else if self.should_prefer_portal_pointer_backend().await {
             let _ = self.capture_space_rect().await;
             match self.ensure_portal_pointer_session().await {
-                Ok(Some(session)) => {
+                Ok(Some(ensured)) => {
+                    if ensured.hold_input {
+                        return Json(held_after_consent_output("drag", received));
+                    }
+                    let session = ensured.session;
                     let Some((start_x, start_y)) =
                         self.logical_portal_point(&session, params.start_x, params.start_y)
                     else {
@@ -2037,7 +2049,9 @@ impl ComputerUseLinux {
         let capture = params.capture.clone();
         let target = params.window_target();
         let gated = async {
-            let base = ActionFacts::new("press_key").with_key(&params.key);
+            let base = ActionFacts::new("press_key")
+                .with_key(&params.key)
+                .with_window_target(target.has_target());
             let entry = self.gate_enter(&base).await?;
             let window = self.gate_window(Some(&target), false).await;
             let mut facts = Self::facts_with_window(base, window.as_ref());
@@ -2098,7 +2112,11 @@ impl ComputerUseLinux {
         self.indicator.keys(&params.key, secret).await;
         if self.should_prefer_portal_keyboard_for_chords().await {
             match self.ensure_portal_keyboard_session().await {
-                Ok(Some(session)) => {
+                Ok(Some(ensured)) => {
+                    if ensured.hold_input {
+                        return Json(held_after_consent_output("press_key", received));
+                    }
+                    let session = ensured.session;
                     // KDE keeps physical keycodes: its keysym path is untested
                     // here, and #191 was reported against mutter.
                     let (modifiers, key) = portal_key_chord(&params.key)
@@ -2249,7 +2267,9 @@ impl ComputerUseLinux {
         let capture = params.capture.clone();
         let target = params.window_target();
         let gated = async {
-            let base = ActionFacts::new("type_text").with_text(&params.text);
+            let base = ActionFacts::new("type_text")
+                .with_text(&params.text)
+                .with_window_target(target.has_target());
             let entry = self.gate_enter(&base).await?;
             let window = self.gate_window(Some(&target), false).await;
             let facts = Self::facts_with_window(base, window.as_ref());
@@ -2337,7 +2357,11 @@ impl ComputerUseLinux {
         self.indicator.text("type_text", &params.text, secret).await;
         if self.should_prefer_kde_clipboard_text_backend() {
             match self.ensure_portal_keyboard_session().await {
-                Ok(Some(session)) => {
+                Ok(Some(ensured)) => {
+                    if ensured.hold_input {
+                        return Json(held_after_consent_output("type_text", received));
+                    }
+                    let session = ensured.session;
                     let kde_focus = if window_target.has_target() {
                         match self.focus_target_for_input(&window_target).await {
                             Ok(focus) => focus,
@@ -2399,13 +2423,17 @@ impl ComputerUseLinux {
                         .await
                         .map_err(|error| format!("Literal text was not sent: {error:#}"))?;
                 }
-                let session = self
+                let ensured = self
                     .ensure_portal_keyboard_session()
                     .await
                     .map_err(|error| format!("Portal text input could not start: {error:#}"))?
                     .ok_or_else(|| {
                         "Portal keyboard input is unavailable; no text was sent.".to_string()
                     })?;
+                if ensured.hold_input {
+                    return Err(FRESH_CONSENT_MESSAGE.to_string());
+                }
+                let session = ensured.session;
                 type_text_with_keysyms(&session, &keysyms)
                     .await
                     .map_err(|error| {
@@ -2618,7 +2646,7 @@ impl ComputerUseLinux {
     // can't be env!("CARGO_PKG_VERSION"); the MCP safety check (CI) fails the
     // build if it drifts from the Cargo version.
     version = "0.7.20-tmc.1",
-    instructions = "Begin every turn that uses Computer Use by calling get_app_state. If diagnostics report disabled GNOME accessibility, call setup_accessibility before asking the user to retry. Use list_windows/focused_window before targeted keyboard input. If diagnostics report windowing.can_list_windows=false on GNOME, call setup_window_targeting to install the optional GNOME Shell extension backend, then ask the user to log out and back in if the setup report says a shell reload is required. This Linux backend can capture size-bounded screenshots through GNOME Shell or XDG Desktop Portal, read AT-SPI trees with action/value metadata, invoke native AT-SPI actions, set AT-SPI values or editable text, list/focus compositor windows through registered Linux window backends when the session permits it, attach best-effort terminal tty/process metadata to terminal windows, send coordinate or element-targeted click/scroll/drag input through the Wayland remote desktop portal when available, and send literal type_text through KDE clipboard integration on Plasma Wayland, wtype on compatible Wayland compositors, or portal keysyms on other Wayland sessions. Portal text startup or conversion failures return an error without replaying through ydotool. GNOME preflights the complete text against every configured keyboard layout group because the background reader cannot establish the active group; rejected text can use set_value on an editable field. Raw ydotool text is limited to printable ASCII, tab and newline, uses US physical key positions, and requires checking the resulting field contents under the active layout. Screenshot results include width/height for the returned image plus coordinate_width/coordinate_height and scale for desktop coordinate conversion; request more detail with max_width, max_height, max_bytes, format=jpeg, quality, or a smaller target/crop instead of relying on unbounded screenshots. Mutating tools (click, type_text, press_key, scroll, drag, perform_action, set_value, activate_window, move_window, resize_window) accept optional screenshot_after (true, \"screen\", or \"window\") with format/quality/scale/max_width/max_height/max_bytes and optional include_tree=true to return post-action observation in the same tool call. Tools with readOnlyHint=false may mutate local desktop or application state; hosts should require approval for actions that can submit, delete, send, purchase, or overwrite data. For element-targeted actions, prefer element_index from the latest get_app_state result; click, perform_action, and set_value can also use semantic role/name/text/states selectors when the target is unique. type_text and press_key accept optional window_id, pid, app_id, wm_class, title, tty, terminal_pid, terminal_command, or terminal_cwd selectors and refuse targeted input if focus cannot be verified. After targeted keyboard input, results append focused-element feedback from AT-SPI (role, name, editable) and warn when a concrete non-terminal focus is not editable. Exact window focus alone does not suppress a missing-focus warning; only a complete scoped tree containing window/menu chrome without content makes it informational. Terminals accept keyboard input without an EditableText interface. On Hyprland, wtype uses a single literal argument after -- to avoid stdin keymap-refresh corruption; text is visible in process arguments, so confirmed password fields are rejected (use set_value). Terminals and ambiguous fields, with or without AT-SPI, use private stdin for at most 100 Unicode characters per call; split larger input into smaller calls or expose accessibility. Input classification has its own 1500 ms budget, independent of the 250 ms cosmetic indicator timeout. Other compatible compositors retain stdin. The wtype path rejects NUL and more than 131071 UTF-8 bytes before focus or indicators. X11 xdotool can silently substitute symbols under non-US XKB layouts (reported with br/ABNT2) or changing keymap state; inspect the text before pressing Enter or submitting it. A successful type_text result confirms dispatch only; every text backend leaves field contents unverified. Re-observe the target before retrying. Screenshot, click, and input results warn when the target window or coordinate is partially or fully off-screen; use move_window/resize_window (GNOME Shell extension backend) to bring a window fully on-screen before retrying. scroll accepts the same window targeting and relative coordinates as click. get_app_state returns a compact readiness block by default; pass verbose=true for the full diagnostics dump. Scope get_app_state with app_name_or_bundle_identifier or a window target (window_id, pid, app_id, wm_class, title); without one it returns the whole desktop AT-SPI tree, reports tree_scoped=false, and warns in message, which can flood context. accessibility_tree_truncated=true means the node, depth, or read budget stopped traversal with unread elements left; recover by scoping to a narrower app or window target and raising max_nodes or max_depth (hard caps 2000 and 64), not by lowering max_nodes. Electron apps with only window/menu chrome may need --force-renderer-accessibility to expose renderer content. Call list_monitors to see each monitor (index, connector, position, size, primary). To capture one monitor at native size, pass monitor (an index, a connector name, or \"primary\") to screenshot or get_app_state. Monitor screenshots add monitor, origin_x, and origin_y to the metadata: desktop x = origin_x + preview x / scale. Pass monitor to click, drag, or scroll to measure x and y from the top-left corner of that monitor. The server rejects a point outside the monitor. Do not combine monitor with a window target or with relative: true. Mutating tools pass a safety gate in the server. Call policy_status to read the mode (confirm, full, or observe), the kill switch state, and the send-on-Enter app list. In confirm mode, high-impact calls need user confirmation: click or perform_action on a control named like send, submit, delete, pay, kirim, hapus, or bayar; Enter in a messaging app; setup_accessibility, setup_window_targeting, and run_shell. A refused call returns ok=false with a reason. Do not retry it and do not try to bypass the gate. Tell the user which mode or confirmation allows it. Typing into a password field is refused in confirm mode. Enter in a terminal runs a shell command, so it needs confirmation too. The operator can stop all input with the kill switch (computer-use-linux stop). screenshot with a window target raises that window, so observe mode refuses it. Use raise_window=false to capture without changing focus."
+    instructions = "Begin every turn that uses Computer Use by calling get_app_state. If diagnostics report disabled GNOME accessibility, call setup_accessibility before asking the user to retry. Use list_windows/focused_window before targeted keyboard input. If diagnostics report windowing.can_list_windows=false on GNOME, call setup_window_targeting to install the optional GNOME Shell extension backend, then ask the user to log out and back in if the setup report says a shell reload is required. This Linux backend can capture size-bounded screenshots through GNOME Shell or XDG Desktop Portal, read AT-SPI trees with action/value metadata, invoke native AT-SPI actions, set AT-SPI values or editable text, list/focus compositor windows through registered Linux window backends when the session permits it, attach best-effort terminal tty/process metadata to terminal windows, send coordinate or element-targeted click/scroll/drag input through the Wayland remote desktop portal when available, and send literal type_text through KDE clipboard integration on Plasma Wayland, wtype on compatible Wayland compositors, or portal keysyms on other Wayland sessions. Portal text startup or conversion failures return an error without replaying through ydotool. GNOME preflights the complete text against every configured keyboard layout group because the background reader cannot establish the active group; rejected text can use set_value on an editable field. Raw ydotool text is limited to printable ASCII, tab and newline, uses US physical key positions, and requires checking the resulting field contents under the active layout. Screenshot results include width/height for the returned image plus coordinate_width/coordinate_height and scale for desktop coordinate conversion; request more detail with max_width, max_height, max_bytes, format=jpeg, quality, or a smaller target/crop instead of relying on unbounded screenshots. Mutating tools (click, type_text, press_key, scroll, drag, perform_action, set_value, activate_window, move_window, resize_window) accept optional screenshot_after (true, \"screen\", or \"window\") with format/quality/scale/max_width/max_height/max_bytes and optional include_tree=true to return post-action observation in the same tool call. Tools with readOnlyHint=false may mutate local desktop or application state; hosts should require approval for actions that can submit, delete, send, purchase, or overwrite data. For element-targeted actions, prefer element_index from the latest get_app_state result; click, perform_action, and set_value can also use semantic role/name/text/states selectors when the target is unique. type_text and press_key accept optional window_id, pid, app_id, wm_class, title, tty, terminal_pid, terminal_command, or terminal_cwd selectors and refuse targeted input if focus cannot be verified. After targeted keyboard input, results append focused-element feedback from AT-SPI (role, name, editable) and warn when a concrete non-terminal focus is not editable. Exact window focus alone does not suppress a missing-focus warning; only a complete scoped tree containing window/menu chrome without content makes it informational. Terminals accept keyboard input without an EditableText interface. On Hyprland, wtype uses a single literal argument after -- to avoid stdin keymap-refresh corruption; text is visible in process arguments, so confirmed password fields are rejected (use set_value). Terminals and ambiguous fields, with or without AT-SPI, use private stdin for at most 100 Unicode characters per call; split larger input into smaller calls or expose accessibility. Input classification has its own 1500 ms budget, independent of the 250 ms cosmetic indicator timeout. Other compatible compositors retain stdin. The wtype path rejects NUL and more than 131071 UTF-8 bytes before focus or indicators. X11 xdotool can silently substitute symbols under non-US XKB layouts (reported with br/ABNT2) or changing keymap state; inspect the text before pressing Enter or submitting it. A successful type_text result confirms dispatch only; every text backend leaves field contents unverified. Re-observe the target before retrying. Screenshot, click, and input results warn when the target window or coordinate is partially or fully off-screen; use move_window/resize_window (GNOME Shell extension backend) to bring a window fully on-screen before retrying. scroll accepts the same window targeting and relative coordinates as click. get_app_state returns a compact readiness block by default; pass verbose=true for the full diagnostics dump. Scope get_app_state with app_name_or_bundle_identifier or a window target (window_id, pid, app_id, wm_class, title); without one it returns the whole desktop AT-SPI tree, reports tree_scoped=false, and warns in message, which can flood context. accessibility_tree_truncated=true means the node, depth, or read budget stopped traversal with unread elements left; recover by scoping to a narrower app or window target and raising max_nodes or max_depth (hard caps 2000 and 64), not by lowering max_nodes. Electron apps with only window/menu chrome may need --force-renderer-accessibility to expose renderer content. Call list_monitors to see each monitor (index, connector, position, size, primary). To capture one monitor at native size, pass monitor (an index, a connector name, or \"primary\") to screenshot or get_app_state. Monitor screenshots add monitor, origin_x, and origin_y to the metadata: desktop x = origin_x + preview x / scale. Pass monitor to click, drag, or scroll to measure x and y from the top-left corner of that monitor. The server rejects a point outside the monitor. Do not combine monitor with a window target or with relative: true. Mutating tools pass a safety gate in the server. Call policy_status to read the mode (confirm, full, or observe), the kill switch state, and the send-on-Enter app list. In confirm mode, high-impact calls need user confirmation: click or perform_action on a control named like send, submit, delete, pay, kirim, hapus, or bayar; Enter in a messaging app; setup_accessibility, setup_window_targeting, and run_shell. A refused call returns ok=false with a reason. Do not retry it and do not try to bypass the gate. Tell the user which mode or confirmation allows it. Typing into a password field is refused in confirm mode. Enter in a terminal runs a shell command, so it needs confirmation too. The operator can stop all input with the kill switch (computer-use-linux stop). screenshot with a window target raises that window, so observe mode refuses it. Use raise_window=false to capture without changing focus. In confirm mode, type_text and press_key need a known target window; on GNOME run setup_window_targeting first. The first input call after a permission dialog returns ok=false without input; observe the screen and send it again."
 )]
 impl ServerHandler for ComputerUseLinux {}
 
@@ -4440,46 +4468,74 @@ impl ComputerUseLinux {
         }
     }
 
-    async fn ensure_portal_pointer_session(&self) -> Result<Option<PortalPointerSession>> {
+    async fn ensure_portal_pointer_session(
+        &self,
+    ) -> Result<Option<EnsuredPortalSession<PortalPointerSession>>> {
         if !self.should_prefer_portal_pointer_backend().await {
             return Ok(None);
         }
         if let Some(session) = self.cached_portal_pointer_session() {
-            return Ok(Some(session));
+            return Ok(Some(EnsuredPortalSession::new(
+                session,
+                PortalSessionSource::Cached,
+            )));
         }
 
         let _guard = self.portal_session_init_lock.lock().await;
         if let Some(session) = self.cached_portal_pointer_session() {
-            return Ok(Some(session));
+            return Ok(Some(EnsuredPortalSession::new(
+                session,
+                PortalSessionSource::Cached,
+            )));
         }
 
-        let session = start_portal_pointer_session().await?;
+        let started = start_portal_pointer_session().await?;
+        // The session stays in the cache, so the next call sends at once.
         if let Ok(mut cached) = self.portal_pointer_session.lock() {
-            *cached = Some(session.clone());
+            *cached = Some(started.session.clone());
         }
-        Ok(Some(session))
+        Ok(Some(EnsuredPortalSession::new(
+            started.session,
+            PortalSessionSource::Started {
+                restored_grant: started.restored_grant,
+            },
+        )))
     }
 
-    async fn ensure_portal_keyboard_session(&self) -> Result<Option<PortalKeyboardSession>> {
+    async fn ensure_portal_keyboard_session(
+        &self,
+    ) -> Result<Option<EnsuredPortalSession<PortalKeyboardSession>>> {
         if env_flag_enabled("COMPUTER_USE_LINUX_FORCE_YDOTOOL_KEYBOARD")
             || !self.is_wayland_session()
         {
             return Ok(None);
         }
         if let Some(session) = self.cached_portal_keyboard_session() {
-            return Ok(Some(session));
+            return Ok(Some(EnsuredPortalSession::new(
+                session,
+                PortalSessionSource::Cached,
+            )));
         }
 
         let _guard = self.portal_session_init_lock.lock().await;
         if let Some(session) = self.cached_portal_keyboard_session() {
-            return Ok(Some(session));
+            return Ok(Some(EnsuredPortalSession::new(
+                session,
+                PortalSessionSource::Cached,
+            )));
         }
 
-        let session = start_portal_keyboard_session().await?;
+        let started = start_portal_keyboard_session().await?;
+        // The session stays in the cache, so the next call sends at once.
         if let Ok(mut cached) = self.portal_keyboard_session.lock() {
-            *cached = Some(session.clone());
+            *cached = Some(started.session.clone());
         }
-        Ok(Some(session))
+        Ok(Some(EnsuredPortalSession::new(
+            started.session,
+            PortalSessionSource::Started {
+                restored_grant: started.restored_grant,
+            },
+        )))
     }
 
     async fn resolve_window_context(
@@ -6525,6 +6581,57 @@ fn unsafe_pointer_fallback(action: &str, received: Option<serde_json::Value>) ->
         implemented: true,
         action: action.to_string(),
         message: "Coordinate input was not sent: ydotool cannot position the pointer accurately on Wayland. Enable the uinput absolute pointer with working screenshot capture, or use COMPUTER_USE_LINUX_FORCE_PORTAL_POINTER=1 with an approved desktop portal session. Remove COMPUTER_USE_LINUX_FORCE_YDOTOOL_POINTER if set.".to_string(),
+        received,
+    }
+}
+
+/// Message for an input call that a new permission dialog held back.
+const FRESH_CONSENT_MESSAGE: &str = "Input permission is now granted. The permission dialog may have moved the focus. Look at the screen again, then send the input again.";
+
+/// Where the portal session of one input call came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PortalSessionSource {
+    /// The server already held the session.
+    Cached,
+    /// The call started the session. `restored_grant` is true when a saved
+    /// grant restored it, so the user saw no permission dialog.
+    Started { restored_grant: bool },
+}
+
+/// True when the call must not send input yet. The call started a session
+/// without a saved grant, so the user just answered a permission dialog. The
+/// dialog may have moved the focus to another window.
+fn hold_input_after_consent(source: PortalSessionSource) -> bool {
+    matches!(
+        source,
+        PortalSessionSource::Started {
+            restored_grant: false
+        }
+    )
+}
+
+/// A portal session for one input call, and whether the call holds its input.
+struct EnsuredPortalSession<S> {
+    session: S,
+    hold_input: bool,
+}
+
+impl<S> EnsuredPortalSession<S> {
+    fn new(session: S, source: PortalSessionSource) -> Self {
+        Self {
+            session,
+            hold_input: hold_input_after_consent(source),
+        }
+    }
+}
+
+/// The result of an input call that sent nothing after a new permission dialog.
+fn held_after_consent_output(action: &str, received: Option<serde_json::Value>) -> ActionOutput {
+    ActionOutput {
+        ok: false,
+        implemented: true,
+        action: action.to_string(),
+        message: FRESH_CONSENT_MESSAGE.to_string(),
         received,
     }
 }
@@ -8950,6 +9057,76 @@ printf '%s %s\n' "${0##*/}" "$*" >> "$CUL_POINTER_TEST_LOG"
         server.clear_cached_nodes();
         let third = server.snapshot_generation();
         assert!(first < second && second < third, "{first} {second} {third}");
+    }
+
+    #[test]
+    fn input_is_held_only_after_a_new_permission_dialog() {
+        use PortalSessionSource::{Cached, Started};
+        // The server already held the session: no dialog, so send.
+        assert!(!hold_input_after_consent(Cached));
+        // A saved grant restored the session: no dialog, so send.
+        assert!(!hold_input_after_consent(Started {
+            restored_grant: true
+        }));
+        // The user just answered a dialog: the focus may have moved, so hold.
+        assert!(hold_input_after_consent(Started {
+            restored_grant: false
+        }));
+    }
+
+    #[test]
+    fn an_ensured_session_takes_its_hold_from_its_source() {
+        use PortalSessionSource::{Cached, Started};
+        for (source, hold) in [
+            (Cached, false),
+            (
+                Started {
+                    restored_grant: true,
+                },
+                false,
+            ),
+            (
+                Started {
+                    restored_grant: false,
+                },
+                true,
+            ),
+        ] {
+            let ensured = EnsuredPortalSession::new(7_u8, source);
+            assert_eq!(ensured.hold_input, hold, "{source:?}");
+            assert_eq!(ensured.session, 7);
+        }
+    }
+
+    #[test]
+    fn a_held_input_call_returns_ok_false_with_the_next_step() {
+        let received = Some(serde_json::json!({"text": "hello"}));
+        for action in ["click", "drag", "scroll", "type_text", "press_key"] {
+            let output = held_after_consent_output(action, received.clone());
+            assert!(!output.ok, "{action}");
+            assert!(output.implemented, "{action}");
+            assert_eq!(output.action, action);
+            assert_eq!(output.message, FRESH_CONSENT_MESSAGE);
+            assert_eq!(output.received, received);
+        }
+        assert_eq!(
+            FRESH_CONSENT_MESSAGE,
+            "Input permission is now granted. The permission dialog may have moved the focus. Look at the screen again, then send the input again."
+        );
+    }
+
+    #[test]
+    fn the_server_instructions_state_both_input_guards() {
+        let info = ComputerUseLinux::default().get_info();
+        let text = info.instructions.unwrap_or_default();
+        assert!(
+            text.contains("In confirm mode, type_text and press_key need a known target window; on GNOME run setup_window_targeting first."),
+            "missing the known-window sentence"
+        );
+        assert!(
+            text.contains("The first input call after a permission dialog returns ok=false without input; observe the screen and send it again."),
+            "missing the permission-dialog sentence"
+        );
     }
 
     #[test]

@@ -454,6 +454,9 @@ pub(crate) enum Reason {
     ShellCommand,
     /// The command is too long to show in full. Refused in `confirm` mode.
     CommandTooLong,
+    /// The call names no window and the focused window is unknown. The gate
+    /// cannot tell which window gets the keys. Refused in `confirm` mode.
+    KeysToUnknownWindow,
 }
 
 impl Reason {
@@ -473,6 +476,7 @@ impl Reason {
             Reason::SetupTool => "setup_tool".to_string(),
             Reason::ShellCommand => "shell_command".to_string(),
             Reason::CommandTooLong => "command_too_long".to_string(),
+            Reason::KeysToUnknownWindow => "keys_to_unknown_window".to_string(),
         }
     }
 
@@ -514,6 +518,7 @@ impl Reason {
             Reason::CommandTooLong => format!(
                 "The shell command is longer than {RUN_SHELL_PREVIEW_MAX_CHARS} characters, so the user cannot read all of it in a confirmation."
             ),
+            Reason::KeysToUnknownWindow => "The server cannot see which window has keyboard focus, so it does not send keys in confirm mode. Run setup_window_targeting, then pass a window target, or ask the user for full mode.".to_string(),
         }
     }
 }
@@ -555,6 +560,8 @@ pub(crate) struct ActionFacts {
     pub app_id: Option<String>,
     pub wm_class: Option<String>,
     pub window_title: Option<String>,
+    /// The call names the window that gets the input (a window target).
+    pub window_targeted: bool,
     pub element_role: Option<String>,
     pub element_name: Option<String>,
     pub element_description: Option<String>,
@@ -586,6 +593,13 @@ impl ActionFacts {
         self.app_id = clean(app_id);
         self.wm_class = clean(wm_class);
         self.window_title = clean(title);
+        self
+    }
+
+    /// Mark that the call names the window that gets the input. The dispatch
+    /// then refuses the input when it cannot verify the focus.
+    pub(crate) fn with_window_target(mut self, targeted: bool) -> Self {
+        self.window_targeted = targeted;
         self
     }
 
@@ -636,6 +650,12 @@ impl ActionFacts {
 
     fn has_window(&self) -> bool {
         self.app_id.is_some() || self.wm_class.is_some() || self.window_title.is_some()
+    }
+
+    /// True when no window is named and the gate cannot identify the focused
+    /// window, so it cannot tell which window gets the keys.
+    fn keys_go_to_unknown_window(&self) -> bool {
+        !self.window_targeted && !self.has_window()
     }
 
     fn app(&self) -> Option<&str> {
@@ -883,6 +903,9 @@ pub(crate) fn classify(facts: &ActionFacts, lists: &AppLists) -> Classification 
             if facts.element_is_password() {
                 return Classification::blocked(Reason::PasswordField);
             }
+            if facts.keys_go_to_unknown_window() {
+                return Classification::blocked(Reason::KeysToUnknownWindow);
+            }
             if facts.text_has_newline {
                 if let Some(rating) = enter_rating(
                     facts,
@@ -904,6 +927,9 @@ pub(crate) fn classify(facts: &ActionFacts, lists: &AppLists) -> Classification 
             // role is unknown, and the key goes through.
             if facts.element_is_password() && !is_password_safe_key(key) {
                 return Classification::blocked(Reason::PasswordField);
+            }
+            if facts.keys_go_to_unknown_window() {
+                return Classification::blocked(Reason::KeysToUnknownWindow);
             }
             // Ctrl+O is Enter in a terminal. An unknown window may be one.
             let enters = is_enter_key(key)
@@ -1853,6 +1879,11 @@ mod tests {
         ActionFacts::new(tool).with_window(Some(app_id), None, Some(title))
     }
 
+    /// A call with a window target whose window the gate cannot read.
+    fn targeted(tool: &'static str) -> ActionFacts {
+        ActionFacts::new(tool).with_window_target(true)
+    }
+
     // ----- commit words -----
 
     #[test]
@@ -2131,11 +2162,11 @@ mod tests {
 
     #[test]
     fn enter_with_unknown_window_needs_confirmation() {
-        let cls = classify(&facts("press_key").with_key("Return"), &apps());
+        let cls = classify(&targeted("press_key").with_key("Return"), &apps());
         assert_eq!(cls.tier, Tier::High);
         assert_eq!(cls.reason, Some(Reason::EnterInUnknownWindow));
         assert_eq!(
-            classify(&facts("press_key").with_key("Escape"), &apps()).tier,
+            classify(&targeted("press_key").with_key("Escape"), &apps()).tier,
             Tier::Low
         );
     }
@@ -2173,7 +2204,11 @@ mod tests {
             assert_eq!(cls.tier, Tier::Blocked, "{role}");
             assert_eq!(cls.reason, Some(Reason::PasswordField));
         }
-        let plain = facts("type_text").with_element(Some("text"), Some("Password hint"), None);
+        let plain = in_window("type_text", "firefox", "Login").with_element(
+            Some("text"),
+            Some("Password hint"),
+            None,
+        );
         assert_eq!(classify(&plain, &apps()).tier, Tier::Low);
     }
 
@@ -2183,12 +2218,12 @@ mod tests {
         assert_eq!(classify(&in_chat, &apps()).tier, Tier::High);
         let in_editor = in_window("type_text", "gedit", "notes").with_text("hello\nworld");
         assert_eq!(classify(&in_editor, &apps()).tier, Tier::Low);
-        let unknown = facts("type_text").with_text("a\r\nb");
+        let unknown = targeted("type_text").with_text("a\r\nb");
         assert_eq!(
             classify(&unknown, &apps()).reason,
             Some(Reason::NewlineInUnknownWindow)
         );
-        let one_line = facts("type_text").with_text("hello world");
+        let one_line = in_window("type_text", "gedit", "notes").with_text("hello world");
         assert_eq!(classify(&one_line, &apps()).tier, Tier::Low);
     }
 
@@ -2331,10 +2366,10 @@ mod tests {
     #[test]
     fn enter_with_an_unknown_window_is_high_for_every_enter_spelling() {
         for key in ["Enter", "Return", "KP_Enter", "Ctrl+Return"] {
-            let cls = classify(&facts("press_key").with_key(key), &apps());
+            let cls = classify(&targeted("press_key").with_key(key), &apps());
             assert_eq!(cls.reason, Some(Reason::EnterInUnknownWindow), "{key}");
         }
-        let typed = classify(&facts("type_text").with_text("a\nb"), &apps());
+        let typed = classify(&targeted("type_text").with_text("a\nb"), &apps());
         assert_eq!(typed.reason, Some(Reason::NewlineInUnknownWindow));
     }
 
@@ -2355,7 +2390,7 @@ mod tests {
             );
             assert_eq!(cls.reason, Some(Reason::EnterInSendApp), "{key}");
             // Unknown window.
-            let cls = classify(&facts("press_key").with_key(key), &apps());
+            let cls = classify(&targeted("press_key").with_key(key), &apps());
             assert_eq!(cls.reason, Some(Reason::EnterInUnknownWindow), "{key}");
             // Commit control.
             let facts = in_window("press_key", "gedit", "notes")
@@ -2411,7 +2446,7 @@ mod tests {
             );
             assert_eq!(by_title.reason, Some(Reason::EnterInTerminal), "{key}");
             // The app of an unknown window may be a terminal.
-            let unknown = classify(&facts("press_key").with_key(key), &apps());
+            let unknown = classify(&targeted("press_key").with_key(key), &apps());
             assert_eq!(unknown.reason, Some(Reason::EnterInUnknownWindow), "{key}");
             // In a known app that is not a terminal, Ctrl+O is "open".
             for (app, title) in [
@@ -2706,6 +2741,105 @@ mod tests {
             Verdict::Refuse(RefuseCause::Blocked)
         );
         assert_eq!(verdict(Mode::Full, Tier::Blocked), Verdict::Allow);
+    }
+
+    // ----- keys to an unknown window -----
+
+    #[test]
+    fn keys_to_an_unknown_window_are_blocked() {
+        let typed = classify(&facts("type_text").with_text("hello"), &apps());
+        assert_eq!(typed.tier, Tier::Blocked);
+        assert_eq!(typed.reason, Some(Reason::KeysToUnknownWindow));
+        assert_eq!(
+            typed.reason.as_ref().unwrap().code(),
+            "keys_to_unknown_window"
+        );
+        for key in ["Escape", "Tab", "a", "Ctrl+L", "Enter", "Ctrl+O", "space"] {
+            let cls = classify(&facts("press_key").with_key(key), &apps());
+            assert_eq!(cls.tier, Tier::Blocked, "{key}");
+            assert_eq!(cls.reason, Some(Reason::KeysToUnknownWindow), "{key}");
+        }
+    }
+
+    #[test]
+    fn a_window_without_any_identity_counts_as_unknown() {
+        let empty = facts("type_text")
+            .with_window(Some("  "), None, Some(""))
+            .with_text("hello");
+        assert_eq!(classify(&empty, &apps()).tier, Tier::Blocked);
+    }
+
+    #[test]
+    fn a_known_window_keeps_the_existing_key_rules() {
+        let typed = in_window("type_text", "gedit", "notes").with_text("hello");
+        assert_eq!(classify(&typed, &apps()).tier, Tier::Low);
+        let escape = in_window("press_key", "gedit", "notes").with_key("Escape");
+        assert_eq!(classify(&escape, &apps()).tier, Tier::Low);
+        let enter = in_window("press_key", "slack", "Slack").with_key("Enter");
+        assert_eq!(
+            classify(&enter, &apps()).reason,
+            Some(Reason::EnterInSendApp)
+        );
+        let line_break = in_window("type_text", "slack", "Slack").with_text("a\nb");
+        assert_eq!(
+            classify(&line_break, &apps()).reason,
+            Some(Reason::NewlineInSendApp)
+        );
+    }
+
+    #[test]
+    fn a_window_target_is_not_refused_by_the_unknown_window_rule() {
+        let typed = targeted("type_text").with_text("hello");
+        assert_eq!(classify(&typed, &apps()).tier, Tier::Low);
+        let escape = targeted("press_key").with_key("Escape");
+        assert_eq!(classify(&escape, &apps()).tier, Tier::Low);
+        // The Enter rules still apply to a targeted call.
+        let enter = targeted("press_key").with_key("Enter");
+        assert_eq!(
+            classify(&enter, &apps()).reason,
+            Some(Reason::EnterInUnknownWindow)
+        );
+    }
+
+    #[test]
+    fn the_unknown_window_rule_covers_keys_only() {
+        for tool in ["click", "scroll", "drag", "perform_action", "set_value"] {
+            assert_eq!(classify(&facts(tool), &apps()).tier, Tier::Low, "{tool}");
+        }
+    }
+
+    #[test]
+    fn a_password_field_keeps_its_own_reason_in_an_unknown_window() {
+        let typed = facts("type_text")
+            .with_element(Some("password text"), None, None)
+            .with_text("pw");
+        assert_eq!(
+            classify(&typed, &apps()).reason,
+            Some(Reason::PasswordField)
+        );
+    }
+
+    #[test]
+    fn the_unknown_window_refusal_names_the_next_steps() {
+        let text = Reason::KeysToUnknownWindow.describe();
+        assert!(text.contains("keyboard focus"), "{text}");
+        assert!(text.contains("setup_window_targeting"), "{text}");
+        assert!(text.contains("window target"), "{text}");
+        assert!(text.contains("full mode"), "{text}");
+    }
+
+    #[test]
+    fn the_unknown_window_rule_refuses_in_confirm_mode_only() {
+        let blocked = Tier::Blocked;
+        assert_eq!(
+            verdict(Mode::Confirm, blocked),
+            Verdict::Refuse(RefuseCause::Blocked)
+        );
+        assert_eq!(verdict(Mode::Full, blocked), Verdict::Allow);
+        assert_eq!(
+            verdict(Mode::Observe, blocked),
+            Verdict::Refuse(RefuseCause::Observe)
+        );
     }
 
     // ----- coordinate clicks -----
@@ -3626,6 +3760,55 @@ mod tests {
         );
         assert_eq!(prompter.calls(), (0, 0));
         assert_eq!(audit_lines(&policy)[0]["decision"], "refused");
+    }
+
+    #[tokio::test]
+    async fn keys_to_an_unknown_window_are_refused_in_confirm_mode_and_audited() {
+        let dir = TestDir::new("unknown-window");
+        let policy = dir.policy(Mode::Confirm);
+        let prompter = FakePrompter::new(Some(ElicitOutcome::Approved), DialogOutcome::Approved);
+        for call in [
+            facts("type_text").with_text("hello"),
+            facts("press_key").with_key("Escape"),
+        ] {
+            let refusal = policy.begin(call, "c", &prompter).await.unwrap_err();
+            assert!(
+                refusal.message.contains("keyboard focus"),
+                "{}",
+                refusal.message
+            );
+            assert!(
+                refusal.message.contains("setup_window_targeting"),
+                "{}",
+                refusal.message
+            );
+        }
+        assert_eq!(prompter.calls(), (0, 0));
+        let lines = audit_lines(&policy);
+        assert_eq!(lines.len(), 2);
+        for line in &lines {
+            assert_eq!(line["phase"], "refused");
+            assert_eq!(line["tier"], "blocked");
+            assert_eq!(line["reason"], "keys_to_unknown_window");
+        }
+    }
+
+    #[tokio::test]
+    async fn keys_to_an_unknown_window_pass_in_full_mode_and_with_a_target() {
+        let dir = TestDir::new("unknown-window-pass");
+        let prompter = FakePrompter::none();
+        let full = dir.policy(Mode::Full);
+        full.begin(facts("type_text").with_text("hello"), "c", &prompter)
+            .await
+            .unwrap()
+            .finish(true);
+        let confirm = dir.policy(Mode::Confirm);
+        confirm
+            .begin(targeted("type_text").with_text("hello"), "c", &prompter)
+            .await
+            .unwrap()
+            .finish(true);
+        assert_eq!(prompter.calls(), (0, 0));
     }
 
     #[tokio::test]

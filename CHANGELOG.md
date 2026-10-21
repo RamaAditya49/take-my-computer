@@ -21,10 +21,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Split the `run_shell` confirmation on every Unicode line break: LF, CR, NEL, vertical tab, form feed, line separator, and paragraph separator. Show every other control character and every format character as a `\u{XXXX}` escape. Normal text stays as it is.
 - Refuse every `press_key` into a known password field in `confirm` mode, except Tab, ISO_Left_Tab, Escape, BackSpace, Delete, the arrow keys, Home, End, Return, KP_Enter, Enter, and chords of these keys with Shift only. This replaces the rule for one printable character.
 - Use the hit test of a coordinate `click` only when the snapshot belongs to the target window or to the focused window, and is younger than 30 seconds. Skip the snapshot root. Check every element under the point, also a container. An element with a commit word wins. Otherwise the smallest element wins. An unnamed container leaves the point unresolved. An unknown window pid also leaves the point unresolved.
+- Refuse `type_text` and `press_key` in `confirm` mode when the call has no window target and the gate cannot see the focused window. The gate cannot tell which window gets the keys. The message tells the agent to run `setup_window_targeting`, then pass a window target, or to ask the user for `full` mode. The audit log records the reason `keys_to_unknown_window`. A call with a window target, and mode `full`, keep the old behavior. This stops input from landing in the wrong window, for example a chat box.
+- Hold the first input call after a new remote desktop permission dialog. When a call starts a new portal session and no saved grant restored it, the call sends no input and returns `ok: false`. The dialog may have moved the focus. The session stays open, so the next call sends at once. This covers `click`, `drag`, `scroll`, `type_text`, and `press_key`.
 
 ### Documentation
 
 - State in the README that the gate guards against mistakes of an agent and is not a sandbox. Add a "Limits" list to the safety gate section.
+- Describe the unknown-window rule for keys and the hold after a permission dialog in "Safety modes" and in the safety gate section. Update the "Limits" list: in `confirm` mode, `type_text` and `press_key` are refused when the window is unknown.
+- Add two sentences to the server instructions for both guards.
 
 ### Changed
 
