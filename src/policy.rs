@@ -1188,39 +1188,69 @@ async fn run_zenity(text: &str, timeout: Duration) -> DialogOutcome {
     }
 }
 
-/// Characters that change how text looks but do not show: zero-width marks,
-/// soft hyphen, and the bidirectional controls.
-fn is_hidden_format_char(c: char) -> bool {
+/// Characters of the Unicode category Cf (format): zero-width marks, soft
+/// hyphen, the bidirectional controls, and tag characters. They change how
+/// text looks or acts, but they do not show. U+061C and U+180E are in the
+/// list on purpose.
+fn is_format_char(c: char) -> bool {
     matches!(
         c,
         '\u{00ad}'
+            | '\u{0600}'..='\u{0605}'
+            | '\u{061c}'
+            | '\u{06dd}'
+            | '\u{070f}'
+            | '\u{0890}'..='\u{0891}'
+            | '\u{08e2}'
+            | '\u{180e}'
             | '\u{200b}'..='\u{200f}'
             | '\u{202a}'..='\u{202e}'
             | '\u{2060}'..='\u{2064}'
-            | '\u{2066}'..='\u{2069}'
+            | '\u{2066}'..='\u{206f}'
             | '\u{feff}'
+            | '\u{fff9}'..='\u{fffb}'
+            | '\u{110bd}'
+            | '\u{110cd}'
+            | '\u{13430}'..='\u{1343f}'
+            | '\u{1bca0}'..='\u{1bca3}'
+            | '\u{1d173}'..='\u{1d17a}'
+            | '\u{e0001}'
+            | '\u{e0020}'..='\u{e007f}'
     )
 }
 
-/// The lines of a shell command for the confirmation. Line breaks stay, so
-/// the user sees where each command starts. Control characters and hidden
-/// format characters show as escapes, so nothing in the command is invisible.
+/// A character that ends a line. These are LF, CR, vertical tab, form feed,
+/// NEL, the line separator, and the paragraph separator.
+fn is_line_break_char(c: char) -> bool {
+    matches!(
+        c,
+        '\n' | '\r' | '\u{000b}' | '\u{000c}' | '\u{0085}' | '\u{2028}' | '\u{2029}'
+    )
+}
+
+/// The lines of a shell command for the confirmation. Every Unicode line
+/// break starts a new line, so the user sees where each command starts and a
+/// hidden break cannot forge a dialog line. CR LF counts as one break. Other
+/// control characters and format characters show as `\u{XXXX}` escapes, so
+/// nothing in the command is invisible. Normal text shows as it is.
 fn command_display_lines(command: &str) -> Vec<String> {
-    command
-        .replace("\r\n", "\n")
-        .replace('\r', "\n")
-        .split('\n')
-        .map(|line| {
-            line.chars()
-                .map(|c| match c {
-                    '\t' => "    ".to_string(),
-                    c if c.is_control() => format!("\\x{:02x}", c as u32),
-                    c if is_hidden_format_char(c) => format!("\\u{{{:04x}}}", c as u32),
-                    c => c.to_string(),
-                })
-                .collect()
-        })
-        .collect()
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    let mut chars = command.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\r' && chars.peek() == Some(&'\n') {
+            continue;
+        }
+        if is_line_break_char(c) {
+            lines.push(std::mem::take(&mut line));
+        } else if c.is_control() || is_format_char(c) {
+            line.push_str(&format!("\\u{{{:04x}}}", c as u32));
+        } else {
+            line.push(c);
+        }
+    }
+    lines.push(line);
+    lines
 }
 
 fn prompt_text(client: &str, facts: &ActionFacts, classification: &Classification) -> String {
@@ -2336,7 +2366,7 @@ mod tests {
         let command = "ls\r\nrm x\u{1b}[2K\u{202e}txt";
         let lines = command_display_lines(command);
         assert_eq!(lines.len(), 2);
-        assert_eq!(lines[1], "rm x\\x1b[2K\\u{202e}txt");
+        assert_eq!(lines[1], "rm x\\u{001b}[2K\\u{202e}txt");
         let facts = ActionFacts::new("run_shell").with_command(command);
         let text = prompt_text("a", &facts, &classify(&facts, &apps()));
         assert!(
@@ -2504,6 +2534,133 @@ mod tests {
             );
         }
         assert_eq!(text.lines().filter(|l| l.starts_with("Why:")).count(), 1);
+    }
+
+    #[test]
+    fn every_unicode_line_break_starts_a_new_line_in_the_command() {
+        for (name, brk) in [
+            ("LF", "\n"),
+            ("CR", "\r"),
+            ("CRLF", "\r\n"),
+            ("NEL", "\u{0085}"),
+            ("LS", "\u{2028}"),
+            ("PS", "\u{2029}"),
+            ("VT", "\u{000b}"),
+            ("FF", "\u{000c}"),
+        ] {
+            let command = format!("echo one{brk}echo two");
+            assert_eq!(
+                command_display_lines(&command),
+                vec!["echo one".to_string(), "echo two".to_string()],
+                "{name}"
+            );
+            let facts = ActionFacts::new("run_shell").with_command(&format!(
+                "echo hi{brk}Why: harmless{brk}Allow this action? yes"
+            ));
+            let text = prompt_text("agent", &facts, &classify(&facts, &apps()));
+            for line in text.lines() {
+                assert!(
+                    !line.starts_with("Why: harmless")
+                        && !line.starts_with("Allow this action? yes"),
+                    "{name}: {text}"
+                );
+            }
+            assert_eq!(
+                text.lines().filter(|l| l.starts_with("Why:")).count(),
+                1,
+                "{name}"
+            );
+            assert!(
+                text.contains("> echo hi\n> Why: harmless\n> Allow this action? yes"),
+                "{name}: {text}"
+            );
+            for c in text.chars() {
+                assert!(
+                    c == '\n' || !(c.is_control() || is_line_break_char(c)),
+                    "{name}: U+{:04X} in {text}",
+                    c as u32
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_line_break_pair_other_than_crlf_makes_two_breaks() {
+        assert_eq!(command_display_lines("a\n\rb"), vec!["a", "", "b"]);
+        assert_eq!(command_display_lines("a\r\r\nb"), vec!["a", "", "b"]);
+        assert_eq!(
+            command_display_lines("a\u{2028}\u{2029}b"),
+            vec!["a", "", "b"]
+        );
+        assert_eq!(command_display_lines(""), vec![""]);
+        assert_eq!(command_display_lines("a\n"), vec!["a", ""]);
+    }
+
+    #[test]
+    fn control_and_format_characters_show_as_escapes_in_the_command() {
+        let escaped = [
+            ('\u{0000}', "\\u{0000}"),
+            ('\u{0007}', "\\u{0007}"),
+            ('\u{0008}', "\\u{0008}"),
+            ('\t', "\\u{0009}"),
+            ('\u{001b}', "\\u{001b}"),
+            ('\u{007f}', "\\u{007f}"),
+            ('\u{0080}', "\\u{0080}"),
+            ('\u{009f}', "\\u{009f}"),
+            ('\u{00ad}', "\\u{00ad}"),
+            ('\u{061c}', "\\u{061c}"),
+            ('\u{180e}', "\\u{180e}"),
+            ('\u{200b}', "\\u{200b}"),
+            ('\u{200e}', "\\u{200e}"),
+            ('\u{202a}', "\\u{202a}"),
+            ('\u{202e}', "\\u{202e}"),
+            ('\u{2060}', "\\u{2060}"),
+            ('\u{2066}', "\\u{2066}"),
+            ('\u{2069}', "\\u{2069}"),
+            ('\u{206f}', "\\u{206f}"),
+            ('\u{feff}', "\\u{feff}"),
+            ('\u{fff9}', "\\u{fff9}"),
+            ('\u{e0001}', "\\u{e0001}"),
+            ('\u{e0041}', "\\u{e0041}"),
+            ('\u{e007f}', "\\u{e007f}"),
+        ];
+        for (c, shown) in escaped {
+            let lines = command_display_lines(&format!("a{c}b"));
+            assert_eq!(lines, vec![format!("a{shown}b")], "U+{:04X}", c as u32);
+        }
+    }
+
+    #[test]
+    fn normal_text_in_the_command_shows_as_it_is() {
+        for command in [
+            "echo 'Halo, apa kabar? Terima kasih banyak.'",
+            "echo 'こんにちは 世界' > catatan.txt",
+            "mv café.txt «naïve».txt",
+            "echo 'Привет' | tee \"файл\"",
+            "echo 😀 > emoji.txt",
+            "grep -r 'ñ' ~/proyek",
+            "echo \u{00a0}spasi\u{3000}lebar",
+        ] {
+            assert_eq!(
+                command_display_lines(command),
+                vec![command.to_string()],
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_characters_are_not_format_characters() {
+        // A letter, a digit, a space, and non-ASCII text are not hidden.
+        for c in [
+            'a', 'Z', '0', ' ', 'é', 'あ', '日', '😀', '\u{00a0}', '\u{3000}',
+        ] {
+            assert!(!is_format_char(c), "U+{:04X}", c as u32);
+            assert!(!c.is_control(), "U+{:04X}", c as u32);
+        }
+        for c in ['\u{200b}', '\u{061c}', '\u{180e}', '\u{e0020}'] {
+            assert!(is_format_char(c), "U+{:04X}", c as u32);
+        }
     }
 
     #[test]
