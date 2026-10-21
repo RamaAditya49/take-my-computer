@@ -3899,14 +3899,16 @@ fn is_container_role(role: &str) -> bool {
     CONTAINER_ROLES.contains(&role.as_str())
 }
 
-/// The smallest control of the snapshot whose bounds hold the desktop point.
+/// The smallest element of the snapshot whose bounds hold the desktop point.
 /// A deeper element wins a tie, because it is the more specific control. The
-/// snapshot root and the elements with a container role do not count: they
-/// hold the point, but they do not say what is under it.
+/// snapshot root does not count. A container role still wins when it is the
+/// smallest element, because web pages make clickable controls from generic
+/// containers; a larger ancestor never replaces it. An unnamed container does
+/// not say what is under the point, so the point stays unresolved.
 fn smallest_node_at(nodes: &[AccessibilityNode], x: i32, y: i32) -> Option<&AccessibilityNode> {
-    nodes
+    let node = nodes
         .iter()
-        .filter(|node| node.parent_index.is_some() && !is_container_role(&node.role))
+        .filter(|node| node.parent_index.is_some())
         .filter_map(|node| {
             let bounds = node.bounds.as_ref()?;
             if bounds.width <= 0 || bounds.height <= 0 {
@@ -3926,7 +3928,12 @@ fn smallest_node_at(nodes: &[AccessibilityNode], x: i32, y: i32) -> Option<&Acce
             })
         })
         .min_by_key(|(key, _)| *key)
-        .map(|(_, node)| node)
+        .map(|(_, node)| node)?;
+    let has_text = |text: &Option<String>| text.as_deref().is_some_and(|t| !t.trim().is_empty());
+    if is_container_role(&node.role) && !has_text(&node.name) && !has_text(&node.description) {
+        return None;
+    }
+    Some(node)
 }
 
 fn refused_output(tool: &str, refusal: &Refusal) -> ActionOutput {
@@ -8652,7 +8659,7 @@ printf '%s %s\n' "${0##*/}" "$*" >> "$CUL_POINTER_TEST_LOG"
     }
 
     #[test]
-    fn hit_test_ignores_container_roles() {
+    fn hit_test_keeps_the_smallest_element_even_with_a_container_role() {
         for role in [
             "application",
             "window",
@@ -8668,19 +8675,32 @@ printf '%s %s\n' "${0##*/}" "$*" >> "$CUL_POINTER_TEST_LOG"
             "Scroll_Pane",
             "FILLER",
         ] {
-            // A container alone does not say what is under the point.
-            let alone = [role_node(1, "Send", role, bounds(0, 0, 100, 100))];
+            // An unnamed container does not say what is under the point.
+            let alone = [role_node(1, "", role, bounds(0, 0, 100, 100))];
             assert!(smallest_node_at(&alone, 5, 5).is_none(), "{role}");
-            // A container smaller than the control does not hide the control.
+            // A named container is what the user clicks, for example a web
+            // div that acts as a button.
+            let named = [role_node(1, "Send", role, bounds(0, 0, 100, 100))];
+            assert_eq!(
+                smallest_node_at(&named, 5, 5).and_then(|node| node.name.as_deref()),
+                Some("Send"),
+                "{role}"
+            );
+            // A larger ancestor never replaces the smallest element.
             let nested = [
-                named_node(1, "Delete", bounds(0, 0, 100, 100)),
-                role_node(2, "Send", role, bounds(0, 0, 10, 10)),
+                named_node(1, "Items", bounds(0, 0, 100, 100)),
+                role_node(2, "Pay", role, bounds(0, 0, 10, 10)),
             ];
             assert_eq!(
                 smallest_node_at(&nested, 5, 5).and_then(|node| node.name.as_deref()),
-                Some("Delete"),
+                Some("Pay"),
                 "{role}"
             );
+            let unnamed_inside = [
+                named_node(1, "Items", bounds(0, 0, 100, 100)),
+                role_node(2, "", role, bounds(0, 0, 10, 10)),
+            ];
+            assert!(smallest_node_at(&unnamed_inside, 5, 5).is_none(), "{role}");
         }
         // Roles of real controls still count.
         for role in [
@@ -8845,10 +8865,9 @@ printf '%s %s\n' "${0##*/}" "$*" >> "$CUL_POINTER_TEST_LOG"
     }
 
     #[tokio::test]
-    async fn only_containers_under_the_point_leave_the_point_unresolved() {
+    async fn only_unnamed_containers_under_the_point_leave_the_point_unresolved() {
         let server = ComputerUseLinux::default();
-        let mut panel = role_node(1, "Send area", "panel", bounds(0, 0, 800, 600));
-        panel.description = Some("Send".to_string());
+        let panel = role_node(1, "", "panel", bounds(0, 0, 800, 600));
         server.cache_snapshot(&[root_node(bounds(0, 0, 800, 600)), panel], Some(42));
         let window = window_info(
             7,
