@@ -92,6 +92,9 @@ struct CachedAccessibilitySnapshot {
     /// Grows by one each time the cache is replaced. The safety gate reads it
     /// with the facts it rates. The action refuses to run if it changed.
     generation: u64,
+    /// When the cache was filled. The gate does not trust an old snapshot to
+    /// say what is under a click point.
+    taken_at: Option<std::time::Instant>,
 }
 
 #[derive(Clone, Default)]
@@ -114,6 +117,10 @@ pub struct ComputerUseLinux {
     /// The MCP client, for client name and confirmation requests. Set once
     /// after the handshake in `serve_mcp`.
     peer: Arc<OnceLock<Peer<RoleServer>>>,
+    /// A window that `gate_window` returns in tests, so a test needs no
+    /// window backend.
+    #[cfg(test)]
+    gate_window_stub: Arc<Mutex<Option<WindowInfo>>>,
 }
 
 fn sanitize_unsigned_integer_formats(value: &mut serde_json::Value) {
@@ -2034,8 +2041,8 @@ impl ComputerUseLinux {
             let entry = self.gate_enter(&base).await?;
             let window = self.gate_window(Some(&target), false).await;
             let mut facts = Self::facts_with_window(base, window.as_ref());
-            // Enter and space press a focused control, and a single character
-            // types into a password field, so these keys need the focus.
+            // Enter and space press a focused control, and most other keys
+            // can type into a password field, so these keys need the focus.
             if key_needs_focus_check(&params.key) {
                 facts = self.facts_with_focus(facts, window.as_ref(), &target).await;
             }
@@ -3862,11 +3869,44 @@ const GATE_LOOKUP_TIMEOUT: Duration = Duration::from_millis(1500);
 
 const SNAPSHOT_CHANGED_MESSAGE: &str = "The accessibility snapshot changed after the safety check, so the target may be a different control now. No input was sent. Call get_app_state again, then retry.";
 
-/// The smallest element of the snapshot whose bounds hold the desktop point.
-/// A deeper element wins a tie, because it is the more specific control.
+/// The snapshot is too old to say what is under a click point after this
+/// time. The screen can change in 30 seconds.
+const GATE_SNAPSHOT_MAX_AGE: Duration = Duration::from_secs(30);
+
+/// Roles of elements that only hold other elements. A point on one of them
+/// is not on a control. The role is lowercase, without separators.
+const CONTAINER_ROLES: [&str; 12] = [
+    "application",
+    "window",
+    "frame",
+    "panel",
+    "filler",
+    "scrollpane",
+    "layeredpane",
+    "rootpane",
+    "viewport",
+    "section",
+    "documentframe",
+    "documentweb",
+];
+
+fn is_container_role(role: &str) -> bool {
+    let role: String = role
+        .chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect();
+    CONTAINER_ROLES.contains(&role.as_str())
+}
+
+/// The smallest control of the snapshot whose bounds hold the desktop point.
+/// A deeper element wins a tie, because it is the more specific control. The
+/// snapshot root and the elements with a container role do not count: they
+/// hold the point, but they do not say what is under it.
 fn smallest_node_at(nodes: &[AccessibilityNode], x: i32, y: i32) -> Option<&AccessibilityNode> {
     nodes
         .iter()
+        .filter(|node| node.parent_index.is_some() && !is_container_role(&node.role))
         .filter_map(|node| {
             let bounds = node.bounds.as_ref()?;
             if bounds.width <= 0 || bounds.height <= 0 {
@@ -4024,6 +4064,15 @@ impl ComputerUseLinux {
         target: Option<&WindowTarget>,
         by_element: bool,
     ) -> Option<WindowInfo> {
+        #[cfg(test)]
+        if let Some(window) = self
+            .gate_window_stub
+            .lock()
+            .ok()
+            .and_then(|stub| stub.clone())
+        {
+            return Some(window);
+        }
         let snapshot_pid = by_element
             .then(|| self.last_snapshot.lock().ok().and_then(|cached| cached.pid))
             .flatten();
@@ -4085,10 +4134,23 @@ impl ComputerUseLinux {
         }
     }
 
-    /// The smallest element of the cached snapshot that holds the desktop
-    /// point. It reads the cache only. It never asks AT-SPI.
-    fn gate_node_at(&self, x: i32, y: i32) -> Option<AccessibilityNode> {
+    /// The smallest control of the cached snapshot that holds the desktop
+    /// point. It reads the cache only. It never asks AT-SPI. The snapshot
+    /// counts only when it belongs to the window that gets the click and is
+    /// younger than [`GATE_SNAPSHOT_MAX_AGE`]. With an unknown window pid,
+    /// nothing counts.
+    fn gate_node_at(&self, x: i32, y: i32, window_pid: Option<u32>) -> Option<AccessibilityNode> {
+        let window_pid = window_pid?;
         let cached = self.last_snapshot.lock().ok()?;
+        if cached.pid != Some(window_pid) {
+            return None;
+        }
+        let fresh = cached
+            .taken_at
+            .is_some_and(|taken_at| taken_at.elapsed() <= GATE_SNAPSHOT_MAX_AGE);
+        if !fresh {
+            return None;
+        }
         smallest_node_at(&cached.nodes, x, y).cloned()
     }
 
@@ -4120,17 +4182,19 @@ impl ComputerUseLinux {
 
     /// Facts for a click at a point. The gate hit-tests the point against the
     /// last snapshot. A control under the point gives its name and
-    /// description. With no control, the gate marks the point as unresolved.
+    /// description. With no control, a snapshot of another app, an old
+    /// snapshot, or an unknown window, the gate marks the point as unresolved.
     async fn facts_with_click_point(
         &self,
         facts: ActionFacts,
         params: &ClickParams,
         window: Option<&WindowInfo>,
     ) -> ActionFacts {
+        let window_pid = window.and_then(|window| window.pid);
         let hit = self
             .gate_click_point(params, window)
             .await
-            .and_then(|(x, y)| self.gate_node_at(x, y));
+            .and_then(|(x, y)| self.gate_node_at(x, y, window_pid));
         match hit {
             Some(node) => facts.with_element(
                 Some(&node.role),
@@ -5347,6 +5411,7 @@ impl ComputerUseLinux {
                 nodes: nodes.to_vec(),
                 pid: target_pid,
                 generation: cached.generation.wrapping_add(1),
+                taken_at: Some(std::time::Instant::now()),
             };
         }
     }
@@ -8376,6 +8441,8 @@ printf '%s %s\n' "${0##*/}" "$*" >> "$CUL_POINTER_TEST_LOG"
             }),
         );
         send.name = Some("Send".to_string());
+        send.parent_index = Some(2);
+        send.depth = 1;
         let mut panel = node(
             2,
             Some(Bounds {
@@ -8387,7 +8454,15 @@ printf '%s %s\n' "${0##*/}" "$*" >> "$CUL_POINTER_TEST_LOG"
         );
         panel.role = "panel".to_string();
         panel.name = Some("Chat".to_string());
-        server.cache_nodes(&[panel, send]);
+        // The snapshot belongs to the focused window, as the gate requires.
+        server.cache_snapshot(&[panel, send], Some(4242));
+        *server.gate_window_stub.lock().unwrap() = Some(window_info(
+            9,
+            Some("Chat"),
+            Some("org.example.Chat"),
+            None,
+            Some(4242),
+        ));
         let gate_peer = Arc::clone(&server.peer);
         let (server_transport, client_transport) = tokio::io::duplex(1 << 20);
         let handle = tokio::spawn(async move {
@@ -8495,16 +8570,34 @@ printf '%s %s\n' "${0##*/}" "$*" >> "$CUL_POINTER_TEST_LOG"
         })
     }
 
+    /// A control: a child of the snapshot root.
     fn named_node(index: u32, name: &str, bounds: Option<Bounds>) -> AccessibilityNode {
         let mut node = node(index, bounds);
         node.name = Some(name.to_string());
+        node.parent_index = Some(0);
+        node.depth = 1;
+        node
+    }
+
+    /// The snapshot root: an application with no parent.
+    fn root_node(bounds: Option<Bounds>) -> AccessibilityNode {
+        let mut node = node(0, bounds);
+        node.name = Some("Chat app".to_string());
+        node.role = "application".to_string();
+        node.parent_index = None;
+        node
+    }
+
+    fn role_node(index: u32, name: &str, role: &str, bounds: Option<Bounds>) -> AccessibilityNode {
+        let mut node = named_node(index, name, bounds);
+        node.role = role.to_string();
         node
     }
 
     #[test]
     fn hit_test_picks_the_smallest_element_under_the_point() {
         let nodes = [
-            named_node(0, "Window", bounds(0, 0, 800, 600)),
+            root_node(bounds(0, 0, 800, 600)),
             named_node(1, "Toolbar", bounds(0, 0, 800, 50)),
             named_node(2, "Send", bounds(700, 10, 60, 30)),
         ];
@@ -8513,14 +8606,15 @@ printf '%s %s\n' "${0##*/}" "$*" >> "$CUL_POINTER_TEST_LOG"
         };
         assert_eq!(name(710, 20).as_deref(), Some("Send"));
         assert_eq!(name(100, 20).as_deref(), Some("Toolbar"));
-        assert_eq!(name(100, 400).as_deref(), Some("Window"));
+        // Only the root holds this point, and the root does not count.
+        assert_eq!(name(100, 400), None);
         assert_eq!(name(900, 400), None);
         assert_eq!(name(-1, 0), None);
     }
 
     #[test]
     fn hit_test_treats_the_far_edge_as_outside() {
-        let nodes = [named_node(0, "Send", bounds(10, 10, 20, 20))];
+        let nodes = [named_node(1, "Send", bounds(10, 10, 20, 20))];
         assert!(smallest_node_at(&nodes, 10, 10).is_some());
         assert!(smallest_node_at(&nodes, 29, 29).is_some());
         assert!(smallest_node_at(&nodes, 30, 15).is_none());
@@ -8531,11 +8625,11 @@ printf '%s %s\n' "${0##*/}" "$*" >> "$CUL_POINTER_TEST_LOG"
     #[test]
     fn hit_test_ignores_elements_without_usable_bounds() {
         let nodes = [
-            named_node(0, "No bounds", None),
-            named_node(1, "Empty", bounds(0, 0, 0, 50)),
-            named_node(2, "Negative", bounds(0, 0, 50, -5)),
+            named_node(1, "No bounds", None),
+            named_node(2, "Empty", bounds(0, 0, 0, 50)),
+            named_node(3, "Negative", bounds(0, 0, 50, -5)),
             named_node(
-                3,
+                4,
                 "Placeholder",
                 bounds(i32::MIN, i32::MIN, i32::MAX, i32::MAX),
             ),
@@ -8546,9 +8640,9 @@ printf '%s %s\n' "${0##*/}" "$*" >> "$CUL_POINTER_TEST_LOG"
 
     #[test]
     fn hit_test_prefers_the_deeper_element_when_areas_tie() {
-        let mut outer = named_node(0, "Wrapper", bounds(0, 0, 50, 50));
+        let mut outer = named_node(1, "Wrapper", bounds(0, 0, 50, 50));
         outer.depth = 1;
-        let mut inner = named_node(1, "Send", bounds(0, 0, 50, 50));
+        let mut inner = named_node(2, "Send", bounds(0, 0, 50, 50));
         inner.depth = 3;
         let nodes = [outer, inner];
         assert_eq!(
@@ -8557,19 +8651,91 @@ printf '%s %s\n' "${0##*/}" "$*" >> "$CUL_POINTER_TEST_LOG"
         );
     }
 
+    #[test]
+    fn hit_test_ignores_container_roles() {
+        for role in [
+            "application",
+            "window",
+            "frame",
+            "panel",
+            "filler",
+            "scroll pane",
+            "layered pane",
+            "root pane",
+            "viewport",
+            "section",
+            "document frame",
+            "Scroll_Pane",
+            "FILLER",
+        ] {
+            // A container alone does not say what is under the point.
+            let alone = [role_node(1, "Send", role, bounds(0, 0, 100, 100))];
+            assert!(smallest_node_at(&alone, 5, 5).is_none(), "{role}");
+            // A container smaller than the control does not hide the control.
+            let nested = [
+                named_node(1, "Delete", bounds(0, 0, 100, 100)),
+                role_node(2, "Send", role, bounds(0, 0, 10, 10)),
+            ];
+            assert_eq!(
+                smallest_node_at(&nested, 5, 5).and_then(|node| node.name.as_deref()),
+                Some("Delete"),
+                "{role}"
+            );
+        }
+        // Roles of real controls still count.
+        for role in [
+            "push button",
+            "link",
+            "menu item",
+            "text",
+            "entry",
+            "check box",
+        ] {
+            let nodes = [role_node(1, "Send", role, bounds(0, 0, 100, 100))];
+            assert!(smallest_node_at(&nodes, 5, 5).is_some(), "{role}");
+        }
+    }
+
+    #[test]
+    fn hit_test_ignores_the_snapshot_root_even_with_a_control_role() {
+        let mut root = named_node(0, "Send", bounds(0, 0, 100, 100));
+        root.parent_index = None;
+        root.depth = 0;
+        assert_eq!(root.role, "push button");
+        assert!(smallest_node_at(&[root], 5, 5).is_none());
+    }
+
     fn click_at(x: i32, y: i32) -> ClickParams {
         serde_json::from_value(serde_json::json!({ "x": x, "y": y })).unwrap()
+    }
+
+    fn chat_window(pid: Option<u32>) -> WindowInfo {
+        window_info(7, Some("Chat"), Some("org.example.Chat"), None, pid)
+    }
+
+    fn chat_nodes() -> Vec<AccessibilityNode> {
+        vec![
+            root_node(bounds(0, 0, 800, 600)),
+            named_node(1, "Send message", bounds(700, 10, 60, 30)),
+        ]
+    }
+
+    /// Move the time of the cached snapshot into the past.
+    fn age_snapshot(server: &ComputerUseLinux, seconds: u64) {
+        server.last_snapshot.lock().unwrap().taken_at = Some(
+            std::time::Instant::now()
+                .checked_sub(Duration::from_secs(seconds))
+                .expect("the monotonic clock is older than the test age"),
+        );
     }
 
     #[tokio::test]
     async fn a_coordinate_click_takes_the_element_under_the_point_into_its_facts() {
         let server = ComputerUseLinux::default();
-        server.cache_nodes(&[
-            named_node(0, "Chat", bounds(0, 0, 800, 600)),
-            named_node(1, "Send message", bounds(700, 10, 60, 30)),
-        ]);
+        server.cache_snapshot(&chat_nodes(), Some(42));
+        let window = chat_window(Some(42));
         let facts = server
-            .facts_with_click_point(ActionFacts::new("click"), &click_at(710, 20), None)
+            .facts_with_click_point(ActionFacts::new("click"), &click_at(710, 20), Some(&window))
             .await;
         assert_eq!(facts.element_name.as_deref(), Some("Send message"));
         assert!(!facts.click_point_unresolved);
@@ -8582,24 +8748,136 @@ printf '%s %s\n' "${0##*/}" "$*" >> "$CUL_POINTER_TEST_LOG"
     #[tokio::test]
     async fn a_coordinate_click_with_no_element_is_marked_unresolved() {
         let server = ComputerUseLinux::default();
-        server.cache_nodes(&[named_node(0, "Chat", bounds(0, 0, 100, 100))]);
+        server.cache_snapshot(&chat_nodes(), Some(42));
+        let window = chat_window(Some(42));
         let facts = server
-            .facts_with_click_point(ActionFacts::new("click"), &click_at(500, 500), None)
+            .facts_with_click_point(
+                ActionFacts::new("click"),
+                &click_at(500, 500),
+                Some(&window),
+            )
             .await;
         assert!(facts.click_point_unresolved);
         assert!(facts.element_name.is_none());
         // With no snapshot at all the point is unresolved too.
         server.clear_cached_nodes();
         let facts = server
-            .facts_with_click_point(ActionFacts::new("click"), &click_at(5, 5), None)
+            .facts_with_click_point(ActionFacts::new("click"), &click_at(5, 5), Some(&window))
             .await;
         assert!(facts.click_point_unresolved);
     }
 
     #[tokio::test]
+    async fn a_node_from_another_app_is_ignored_in_the_coordinate_hit_test() {
+        let server = ComputerUseLinux::default();
+        // The snapshot belongs to pid 99. The click goes to a window of pid 42.
+        server.cache_snapshot(&chat_nodes(), Some(99));
+        let window = chat_window(Some(42));
+        let facts = server
+            .facts_with_click_point(ActionFacts::new("click"), &click_at(710, 20), Some(&window))
+            .await;
+        assert!(facts.click_point_unresolved);
+        assert!(facts.element_name.is_none());
+        // The same snapshot counts for a window of pid 99.
+        let owner = chat_window(Some(99));
+        let facts = server
+            .facts_with_click_point(ActionFacts::new("click"), &click_at(710, 20), Some(&owner))
+            .await;
+        assert!(!facts.click_point_unresolved);
+        assert_eq!(facts.element_name.as_deref(), Some("Send message"));
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_of_the_whole_desktop_is_ignored_in_the_coordinate_hit_test() {
+        let server = ComputerUseLinux::default();
+        server.cache_snapshot(&chat_nodes(), None);
+        let window = chat_window(Some(42));
+        let facts = server
+            .facts_with_click_point(ActionFacts::new("click"), &click_at(710, 20), Some(&window))
+            .await;
+        assert!(facts.click_point_unresolved);
+        assert!(facts.element_name.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_window_with_an_unknown_pid_leaves_the_point_unresolved() {
+        let server = ComputerUseLinux::default();
+        server.cache_snapshot(&chat_nodes(), Some(42));
+        let no_pid = chat_window(None);
+        let facts = server
+            .facts_with_click_point(ActionFacts::new("click"), &click_at(710, 20), Some(&no_pid))
+            .await;
+        assert!(facts.click_point_unresolved);
+        assert!(facts.element_name.is_none());
+        // No window at all is the same.
+        let facts = server
+            .facts_with_click_point(ActionFacts::new("click"), &click_at(710, 20), None)
+            .await;
+        assert!(facts.click_point_unresolved);
+        assert!(facts.element_name.is_none());
+    }
+
+    #[tokio::test]
+    async fn an_old_snapshot_is_ignored_in_the_coordinate_hit_test() {
+        let server = ComputerUseLinux::default();
+        server.cache_snapshot(&chat_nodes(), Some(42));
+        let window = chat_window(Some(42));
+        let point = click_at(710, 20);
+        // Young snapshots count.
+        age_snapshot(&server, 5);
+        let facts = server
+            .facts_with_click_point(ActionFacts::new("click"), &point, Some(&window))
+            .await;
+        assert_eq!(facts.element_name.as_deref(), Some("Send message"));
+        // A snapshot older than 30 seconds does not.
+        age_snapshot(&server, 31);
+        let facts = server
+            .facts_with_click_point(ActionFacts::new("click"), &point, Some(&window))
+            .await;
+        assert!(facts.click_point_unresolved);
+        assert!(facts.element_name.is_none());
+        // A fresh snapshot counts again.
+        server.cache_snapshot(&chat_nodes(), Some(42));
+        let facts = server
+            .facts_with_click_point(ActionFacts::new("click"), &point, Some(&window))
+            .await;
+        assert_eq!(facts.element_name.as_deref(), Some("Send message"));
+    }
+
+    #[tokio::test]
+    async fn only_containers_under_the_point_leave_the_point_unresolved() {
+        let server = ComputerUseLinux::default();
+        let mut panel = role_node(1, "Send area", "panel", bounds(0, 0, 800, 600));
+        panel.description = Some("Send".to_string());
+        server.cache_snapshot(&[root_node(bounds(0, 0, 800, 600)), panel], Some(42));
+        let window = window_info(
+            7,
+            Some("Telegram"),
+            Some("org.telegram.desktop"),
+            None,
+            Some(42),
+        );
+        let base = ComputerUseLinux::facts_with_window(ActionFacts::new("click"), Some(&window));
+        let facts = server
+            .facts_with_click_point(base, &click_at(100, 100), Some(&window))
+            .await;
+        assert!(facts.click_point_unresolved);
+        assert!(facts.element_name.is_none());
+        // The point is unresolved, so a send app asks about the click.
+        let rating = crate::policy::classify(&facts, &crate::policy::AppLists::default());
+        assert_eq!(rating.reason, Some(crate::policy::Reason::ClickInSendApp));
+    }
+
+    #[tokio::test]
     async fn a_window_relative_click_point_adds_the_window_origin() {
         let server = ComputerUseLinux::default();
-        server.cache_nodes(&[named_node(1, "Delete", bounds(110, 120, 40, 20))]);
+        server.cache_snapshot(
+            &[
+                root_node(bounds(0, 0, 800, 600)),
+                named_node(1, "Delete", bounds(110, 120, 40, 20)),
+            ],
+            Some(42),
+        );
         // The window origin is (10, 20), so relative (105, 105) is desktop (115, 125).
         let window = window_info(1, Some("Files"), Some("org.example.Files"), None, Some(42));
         let mut params = click_at(105, 105);
