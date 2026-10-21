@@ -2037,7 +2037,9 @@ impl ComputerUseLinux {
         let capture = params.capture.clone();
         let target = params.window_target();
         let gated = async {
-            let base = ActionFacts::new("press_key").with_key(&params.key);
+            let base = ActionFacts::new("press_key")
+                .with_key(&params.key)
+                .with_window_target(target.has_target());
             let entry = self.gate_enter(&base).await?;
             let window = self.gate_window(Some(&target), false).await;
             let mut facts = Self::facts_with_window(base, window.as_ref());
@@ -2249,7 +2251,9 @@ impl ComputerUseLinux {
         let capture = params.capture.clone();
         let target = params.window_target();
         let gated = async {
-            let base = ActionFacts::new("type_text").with_text(&params.text);
+            let base = ActionFacts::new("type_text")
+                .with_text(&params.text)
+                .with_window_target(target.has_target());
             let entry = self.gate_enter(&base).await?;
             let window = self.gate_window(Some(&target), false).await;
             let facts = Self::facts_with_window(base, window.as_ref());
