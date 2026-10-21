@@ -320,6 +320,25 @@ fn ensure_dir(path: &Path) -> std::io::Result<()> {
     if meta.mode() & 0o077 != 0 {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
     }
+    // Another user who owns a parent could swap the directory after this
+    // check. Every parent must belong to this user or to root, and a parent
+    // that others can write must have the sticky bit, as /tmp has.
+    let real = std::fs::canonicalize(path)?;
+    for parent in real.ancestors().skip(1) {
+        let meta = std::fs::symlink_metadata(parent)?;
+        let owner_ok = meta.uid() == uid || meta.uid() == 0;
+        let shared = meta.mode() & 0o022 != 0;
+        let sticky = meta.mode() & 0o1000 != 0;
+        if !owner_ok || (shared && !sticky) {
+            return Err(std::io::Error::new(
+                ErrorKind::PermissionDenied,
+                format!(
+                    "{} is not safe for the safety state: another user can change it",
+                    parent.display()
+                ),
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -3144,6 +3163,20 @@ mod tests {
         std::os::unix::fs::symlink(&real, &link).unwrap();
         let error = ensure_dir(&link).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn a_parent_that_others_can_write_without_sticky_bit_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TestDir::new("open-parent");
+        let parent = dir.0.join("shared");
+        std::fs::create_dir_all(&parent).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let error = ensure_dir(&parent.join("take-my-computer")).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::PermissionDenied);
+        // The sticky bit makes a shared parent safe, as for /tmp.
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        ensure_dir(&parent.join("take-my-computer")).unwrap();
     }
 
     #[test]
