@@ -44,7 +44,9 @@ Stop all input at once with `computer-use-linux stop`. Allow input again with `c
 To bind the stop command to a key, open Settings, Keyboard, Keyboard Shortcuts, Custom Shortcuts, and add a shortcut with the command `computer-use-linux stop`.
 The shortcut needs the CLI on `PATH`. A plugin-only install keeps its binary under `~/.cache/computer-use-linux/plugin/`, so use the full path there.
 
-The audit log is `~/.local/state/take-my-computer/audit.jsonl`. It stores the length and a SHA-256 hash of typed text, never the text.
+The audit log is `~/.local/state/take-my-computer/audit.jsonl`. It stores the length and a SHA-256 hash of typed text, never the text. Each call writes a `start` line before the input and an `end` line after it.
+
+While a confirmation dialog is open, the server holds the input lock. No other call, in this server or in another one, can send input until you answer. The default button of the dialog is Deny. Enter in a terminal (gnome-terminal, kgx, ptyxis, konsole, kitty, alacritty, and others) needs confirmation, because it runs a shell command. Set `TAKE_MY_COMPUTER_TERMINAL_APPS` to change that list.
 
 ---
 
@@ -242,20 +244,35 @@ Set the mode with `TAKE_MY_COMPUTER_POLICY`. An unknown value falls back to `con
 In `confirm` mode these actions need confirmation:
 
 - `click` or `perform_action` on an element whose name or description has a commit word: send, submit, delete, remove, pay, buy, purchase, checkout, publish, post, transfer, confirm, approve, kirim, hapus, bayar, beli, terbitkan, posting, setujui, konfirmasi. Matching is whole-word and case-insensitive, so "Postman" does not match "post".
+- `click` at a pixel (`x` and `y`). The gate looks up the point in the last `get_app_state` snapshot and picks the smallest element that holds it. If that element has a commit word, the click needs confirmation. If no element holds the point, the click needs confirmation only when the target window is known and is a send-on-Enter app. A point given with `monitor` is converted to a desktop point first. The gate never starts a new accessibility lookup for this check.
 - `press_key` with Return, KP_Enter, or Enter (any modifiers) when the focused or targeted window belongs to a send-on-Enter app. The default list is telegram, whatsapp, slack, discord, signal, element, teams, thunderbird, evolution, geary. Set `TAKE_MY_COMPUTER_SEND_APPS` to a comma-separated list to replace it. Entries are case-insensitive substrings of the app id, wm class, or title. If the window is unknown, Enter needs confirmation.
+- `press_key` with Return, KP_Enter, Enter, or space (any modifiers), and `type_text` with a line break, when the focused element has a commit word in its name. The key presses that control.
+- `press_key` with Return, KP_Enter, or Enter, and `type_text` with a line break, when the window is a terminal, because Enter runs a shell command. The default terminal list is gnome-terminal, kgx, ptyxis, console, konsole, kitty, alacritty, foot, wezterm, xterm, tilix, terminator, ghostty, terminal. Set `TAKE_MY_COMPUTER_TERMINAL_APPS` to a comma-separated list to replace it. Matching is the same as for the send-on-Enter list. `policy_status` and `computer-use-linux policy` show both lists as `send_on_enter_apps` and `terminal_apps`.
 - `type_text` with a line break in a send-on-Enter app (or an unknown window), because a line break sends the message.
 - `perform_action` or `set_value` on an element that is not in the last `get_app_state` snapshot.
 - `setup_accessibility`, `setup_window_targeting`, and `run_shell`.
 
-`type_text` or `set_value` into a password field is refused in `confirm` mode. `screenshot` is gated only when it raises a window (a window target with `raise_window` not set to `false`).
+`type_text` or `set_value` into a password field is refused in `confirm` mode. `press_key` with one printable character (for example `a` or `7`) into a password field is refused too.
+
+`run_shell` shows the whole command in the confirmation when it has 2000 characters or fewer. Each line of the command is shown with a `>` prefix, and control characters show as escapes. A longer command is refused in `confirm` mode. Mode `full` allows it.
+
+`screenshot` is gated only when it raises a window (a window target with `raise_window` not set to `false`).
+
+**Known limits.** The coordinate-click check and the password checks need accessibility data. Without AT-SPI, or when the window or its focused element is unknown, these checks cannot see the target and the call is rated from the facts that are known:
+
+- A coordinate click uses the last `get_app_state` snapshot. If the snapshot is old or empty, no element is found. Take a fresh snapshot before you click.
+- The password check reads the role of the focused element. If the role is unknown, the check allows the call. The same holds for the commit-word check of Enter and space.
+- The commit-word check of a focused element reads its name. It does not read its description.
 
 Confirmation uses these channels, in order:
 
 1. MCP elicitation, when the client declared the elicitation capability.
-2. A desktop dialog from `zenity --question` with a 60-second timeout.
+2. A desktop dialog from `zenity --question` with a 60-second timeout. The default button is Deny.
 3. Otherwise the call is refused, and the message names the mode (`full`) that allows it.
 
 The dialog shows the tool, app, window title, element name, and the key or the text length. It never shows typed text. While the server waits, the agent's tool call is blocked, so the agent cannot answer the dialog.
+
+**Order of one call.** The gate works in this order: take the input lock, read the window, element, and focus, rate the call, confirm if needed, write the `start` audit line, send input, write the `end` audit line. If the last accessibility snapshot changed between the rating and the input, the call is refused. The message tells the agent to call `get_app_state` again.
 
 **Kill switch.** While the file `$XDG_STATE_HOME/take-my-computer/STOP` exists (default `~/.local/state/take-my-computer/STOP`), every mutating tool is refused in every mode and sends no input. `computer-use-linux stop` creates the file. `computer-use-linux resume` removes it. To bind `stop` to a GNOME keyboard shortcut (Ctrl+Alt+Esc in this example; use the absolute binary path if GNOME does not find it):
 
@@ -274,9 +291,9 @@ case "$current" in
 esac
 ```
 
-**Input lock.** Each mutating call holds an exclusive `flock` on `$XDG_RUNTIME_DIR/take-my-computer-input.lock`, so two agents cannot interleave input inside one action.
+**Input lock.** Each mutating call takes an exclusive `flock` on `$XDG_RUNTIME_DIR/take-my-computer-input.lock` first. It keeps the lock while the gate reads the desktop, while a confirmation is open, while the action runs, and until the `end` audit line is written. No other call, in this process or in another server process, can send input in that time, so an agent cannot approve its own confirmation through a second call. A call that cannot get the lock in 30 seconds is refused.
 
-**Audit log.** The server appends one JSON line per mutating call to `$XDG_STATE_HOME/take-my-computer/audit.jsonl` (default `~/.local/state/take-my-computer/audit.jsonl`). Fields: `ts` (RFC 3339 UTC), `client`, `tool`, `mode`, `tier`, `decision` (`allowed`, `confirmed`, `denied`, or `refused`), `app`, `window_title`, `element_name`, `key`, `text_len`, `text_sha256`, `ok`, and `reason` when the call was rated high-impact. The log never holds typed text, only its length and SHA-256. Single-character keys are logged as `<char>`. The state directory has mode `0700` and the log has mode `0600`. If the log cannot be written, mutating calls are refused.
+**Audit log.** The server appends JSON lines to `$XDG_STATE_HOME/take-my-computer/audit.jsonl` (default `~/.local/state/take-my-computer/audit.jsonl`). A call that runs writes two lines with the same `call_id`: a `"phase":"start"` line before any input, and a `"phase":"end"` line with `ok` after the action. A refused call writes one `"phase":"refused"` line. Fields: `ts` (RFC 3339 UTC), `call_id`, `phase`, `client`, `tool`, `mode`, `tier`, `decision` (`allowed`, `confirmed`, `denied`, `refused`, or `cancelled`), `app`, `window_title`, `element_name`, `key`, `text_len`, `text_sha256`, `ok` (not on `start` lines), and `reason` when the call was rated high-impact. The log never holds typed text or a shell command, only the length and SHA-256. Single-character keys are logged as `<char>`. The state directory has mode `0700` and the log has mode `0600`. If the `start` line cannot be written, the call is refused and no input is sent. A failed `end` line is reported on stderr only, because the action is done.
 
 ## Support matrix
 
@@ -571,6 +588,7 @@ Most setups need none of these — `doctor` and the installers pick sensible def
 | --- | --- |
 | `TAKE_MY_COMPUTER_POLICY` | Safety gate mode: `confirm` (default), `full`, or `observe`. See [Safety gate](#safety-gate-take-my-computer). |
 | `TAKE_MY_COMPUTER_SEND_APPS` | Comma-separated, case-insensitive substrings of app id, wm class, or title. Replaces the default send-on-Enter app list. |
+| `TAKE_MY_COMPUTER_TERMINAL_APPS` | Same format. Replaces the default terminal app list. Enter in a terminal needs confirmation in `confirm` mode. |
 | `COMPUTER_USE_LINUX_NOTIFY_ON_COMPLETE` | Set exactly to `1` to expose the optional `complete_interaction` notification tool. Requires `notify-send` and a desktop notification service; disabled by default. |
 | `COMPUTER_USE_LINUX_COSMIC_HELPER` | Path to the `computer-use-linux-cosmic` helper when it isn't next to the binary or on `PATH`. |
 | `COMPUTER_USE_LINUX_INDICATOR` | Set to `0` (or `false`/`off`/`no`) to turn off the on-screen indicator. On by default. |
