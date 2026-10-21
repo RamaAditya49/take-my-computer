@@ -243,6 +243,7 @@ function runtimeEnvironment(): Record<string, string> {
 		"CU_DISABLE_ABS_POINTER",
 		"TAKE_MY_COMPUTER_POLICY",
 		"TAKE_MY_COMPUTER_SEND_APPS",
+		"TAKE_MY_COMPUTER_TERMINAL_APPS",
 	]);
 	const env = Object.fromEntries(
 		Object.entries(process.env).filter(

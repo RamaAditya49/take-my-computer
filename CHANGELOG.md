@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- Take the input lock before the gate reads the window and the element, and keep it until the action and its audit line are done. No other call can send input while a confirmation is open. The confirmation dialog now has Deny as the default button.
+- Refuse an element-targeted call when the accessibility snapshot changed between the gate and the action. The message tells the agent to call `get_app_state` again.
+- Rate a coordinate `click` by the smallest element of the last snapshot under the point. A commit word on that element, or an unknown point in a send-on-Enter app, needs confirmation.
+- Rate `press_key` Enter or space, and `type_text` with a line break, by the commit words of the focused element.
+- Add a terminal app list and `TAKE_MY_COMPUTER_TERMINAL_APPS`. Enter in a terminal needs confirmation. `policy_status` and `computer-use-linux policy` show `terminal_apps`.
+- Refuse `press_key` with one printable character into a known password field in `confirm` mode.
+- Write two audit lines for each call that runs, `start` before the input and `end` after it, with a shared `call_id`. Refuse the call when the `start` line cannot be written. A refused call writes one `refused` line.
+- Show the whole `run_shell` command in the confirmation when it has 2000 characters or fewer. Refuse a longer command in `confirm` mode.
+
+### Changed
+
+- Forward `TAKE_MY_COMPUTER_TERMINAL_APPS` to the Pi extension and to the Codex MCP server.
+
 ## [0.7.20-tmc.1] - 2026-10-21
 
 First release of take-my-computer, a fork of `agent-sh/computer-use-linux` 0.7.20. Binary names and `COMPUTER_USE_LINUX_*` variables are unchanged.

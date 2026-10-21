@@ -2,14 +2,23 @@
 //!
 //! MCP annotations are hints only, and many hosts run with approvals off, so
 //! the server enforces the gate itself. Each mutating tool calls
-//! [`Policy::begin`] before it changes focus, shows an indicator event, or
-//! sends input. The gate does five things:
+//! [`Policy::enter`], reads the desktop facts, and then calls
+//! [`Entry::decide`] before it changes focus, shows an indicator event, or
+//! sends input. The gate does these things in this order:
 //!
 //! 1. It refuses every call when the kill switch file exists.
-//! 2. It applies the policy mode (`confirm`, `full`, or `observe`).
-//! 3. It asks the user to confirm high-impact actions.
-//! 4. It holds an exclusive `flock` while the call runs.
-//! 5. It appends one audit line per call. The line never holds typed text.
+//! 2. It refuses every mutating call in the `observe` mode.
+//! 3. It takes an exclusive `flock`. The lock stays until the action and its
+//!    audit line are done. No other call can send input while a dialog is open.
+//! 4. The caller reads the window, element, and focus facts. The facts are
+//!    read after the lock, so they describe the desktop at action time.
+//! 5. It rates the call and asks the user to confirm high-impact actions.
+//! 6. It writes an audit line with `"phase":"start"`. If this write fails,
+//!    the call is refused and no input is sent.
+//! 7. After the action, it writes a second line with `"phase":"end"`. A
+//!    refused call writes one line with `"phase":"refused"`.
+//!
+//! No audit line holds typed text: only length and digest.
 
 use anyhow::{Context, Result};
 use futures_util::future::BoxFuture;
@@ -33,12 +42,16 @@ use std::{
         unix::fs::{DirBuilderExt, OpenOptionsExt},
     },
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 pub(crate) const POLICY_ENV: &str = "TAKE_MY_COMPUTER_POLICY";
 pub(crate) const SEND_APPS_ENV: &str = "TAKE_MY_COMPUTER_SEND_APPS";
+pub(crate) const TERMINAL_APPS_ENV: &str = "TAKE_MY_COMPUTER_TERMINAL_APPS";
 
 /// Apps where a bare Enter key sends a message. Override with
 /// `TAKE_MY_COMPUTER_SEND_APPS`.
@@ -53,6 +66,25 @@ pub(crate) const DEFAULT_SEND_APPS: [&str; 10] = [
     "thunderbird",
     "evolution",
     "geary",
+];
+
+/// Terminal apps. Enter in a terminal runs a shell command. Override with
+/// `TAKE_MY_COMPUTER_TERMINAL_APPS`.
+pub(crate) const DEFAULT_TERMINAL_APPS: [&str; 14] = [
+    "gnome-terminal",
+    "kgx",
+    "ptyxis",
+    "console",
+    "konsole",
+    "kitty",
+    "alacritty",
+    "foot",
+    "wezterm",
+    "xterm",
+    "tilix",
+    "terminator",
+    "ghostty",
+    "terminal",
 ];
 
 /// Words on a control that make a click or action high-impact. English first,
@@ -89,7 +121,9 @@ const LOCK_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const DIALOG_PROCESS_GRACE: Duration = Duration::from_secs(5);
 const AUDIT_FIELD_MAX_CHARS: usize = 200;
 const PROMPT_FIELD_MAX_CHARS: usize = 80;
-const PROMPT_COMMAND_MAX_CHARS: usize = 120;
+/// A shell command up to this length shows in full in the confirmation. A
+/// longer command is refused in `confirm` mode, because the user cannot read it.
+pub(crate) const RUN_SHELL_PREVIEW_MAX_CHARS: usize = 2000;
 
 // ---------------------------------------------------------------------------
 // Mode
@@ -138,13 +172,32 @@ impl Mode {
 // Configuration and paths
 // ---------------------------------------------------------------------------
 
+/// Lowercase substrings that the classifier matches against the app id, the
+/// wm class, and the window title.
+#[derive(Debug, Clone)]
+pub(crate) struct AppLists {
+    /// Apps where Enter sends a message.
+    pub send: Vec<String>,
+    /// Terminal apps, where Enter runs a shell command.
+    pub terminal: Vec<String>,
+}
+
+impl Default for AppLists {
+    fn default() -> Self {
+        Self {
+            send: parse_send_apps(None),
+            terminal: parse_terminal_apps(None),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct PolicyConfig {
     pub mode: Mode,
     pub warning: Option<String>,
     pub state_dir: PathBuf,
     pub lock_path: PathBuf,
-    pub send_apps: Vec<String>,
+    pub apps: AppLists,
     pub lock_timeout: Duration,
     pub dialog_timeout: Duration,
     pub elicit_timeout: Duration,
@@ -170,7 +223,10 @@ impl PolicyConfig {
             warning,
             state_dir,
             lock_path,
-            send_apps: parse_send_apps(get(SEND_APPS_ENV).as_deref()),
+            apps: AppLists {
+                send: parse_send_apps(get(SEND_APPS_ENV).as_deref()),
+                terminal: parse_terminal_apps(get(TERMINAL_APPS_ENV).as_deref()),
+            },
             lock_timeout: INPUT_LOCK_TIMEOUT,
             dialog_timeout: DIALOG_TIMEOUT,
             elicit_timeout: ELICIT_TIMEOUT,
@@ -210,7 +266,7 @@ fn resolve_state_dir(get: &impl Fn(&str) -> Option<String>) -> PathBuf {
 
 /// An empty or blank list means "use the default list". That is the safe
 /// reading: an empty override must not silently disable the check.
-fn parse_send_apps(value: Option<&str>) -> Vec<String> {
+fn parse_app_list(value: Option<&str>, defaults: &[&str]) -> Vec<String> {
     let parsed: Vec<String> = value
         .map(|value| {
             value
@@ -221,13 +277,18 @@ fn parse_send_apps(value: Option<&str>) -> Vec<String> {
         })
         .unwrap_or_default();
     if parsed.is_empty() {
-        DEFAULT_SEND_APPS
-            .iter()
-            .map(|app| (*app).to_string())
-            .collect()
+        defaults.iter().map(|app| (*app).to_string()).collect()
     } else {
         parsed
     }
+}
+
+fn parse_send_apps(value: Option<&str>) -> Vec<String> {
+    parse_app_list(value, &DEFAULT_SEND_APPS)
+}
+
+fn parse_terminal_apps(value: Option<&str>) -> Vec<String> {
+    parse_app_list(value, &DEFAULT_TERMINAL_APPS)
 }
 
 fn ensure_dir(path: &Path) -> std::io::Result<()> {
@@ -291,13 +352,18 @@ impl Tier {
 pub(crate) enum Reason {
     CommitWord(&'static str),
     EnterInSendApp,
+    EnterInTerminal,
     EnterInUnknownWindow,
     NewlineInSendApp,
+    NewlineInTerminal,
     NewlineInUnknownWindow,
+    ClickInSendApp,
     PasswordField,
     UnresolvedElement,
     SetupTool,
     ShellCommand,
+    /// The command is too long to show in full. Refused in `confirm` mode.
+    CommandTooLong,
 }
 
 impl Reason {
@@ -306,13 +372,17 @@ impl Reason {
         match self {
             Reason::CommitWord(word) => format!("commit_word:{word}"),
             Reason::EnterInSendApp => "enter_in_send_app".to_string(),
+            Reason::EnterInTerminal => "enter_in_terminal".to_string(),
             Reason::EnterInUnknownWindow => "enter_in_unknown_window".to_string(),
             Reason::NewlineInSendApp => "newline_in_send_app".to_string(),
+            Reason::NewlineInTerminal => "newline_in_terminal".to_string(),
             Reason::NewlineInUnknownWindow => "newline_in_unknown_window".to_string(),
+            Reason::ClickInSendApp => "click_in_send_app".to_string(),
             Reason::PasswordField => "password_field".to_string(),
             Reason::UnresolvedElement => "unresolved_element".to_string(),
             Reason::SetupTool => "setup_tool".to_string(),
             Reason::ShellCommand => "shell_command".to_string(),
+            Reason::CommandTooLong => "command_too_long".to_string(),
         }
     }
 
@@ -323,6 +393,9 @@ impl Reason {
                 format!("The control name or description contains the word \"{word}\".")
             }
             Reason::EnterInSendApp => "Enter can send a message in this app.".to_string(),
+            Reason::EnterInTerminal => {
+                "Enter in a terminal runs a shell command.".to_string()
+            }
             Reason::EnterInUnknownWindow => {
                 "The app that receives Enter is unknown. Enter can send a message.".to_string()
             }
@@ -330,8 +403,16 @@ impl Reason {
                 "The text has a line break. A line break can send a message in this app."
                     .to_string()
             }
+            Reason::NewlineInTerminal => {
+                "The text has a line break. A line break in a terminal runs a shell command."
+                    .to_string()
+            }
             Reason::NewlineInUnknownWindow => {
                 "The text has a line break and the receiving app is unknown. A line break can send a message."
+                    .to_string()
+            }
+            Reason::ClickInSendApp => {
+                "No known control is at the click point, and this app can send messages."
                     .to_string()
             }
             Reason::PasswordField => "The target is a password field.".to_string(),
@@ -340,6 +421,9 @@ impl Reason {
             }
             Reason::SetupTool => "This tool changes the desktop configuration.".to_string(),
             Reason::ShellCommand => "This tool runs a shell command.".to_string(),
+            Reason::CommandTooLong => format!(
+                "The shell command is longer than {RUN_SHELL_PREVIEW_MAX_CHARS} characters, so the user cannot read all of it in a confirmation."
+            ),
         }
     }
 }
@@ -386,6 +470,8 @@ pub(crate) struct ActionFacts {
     pub element_description: Option<String>,
     /// The call names an element that the cached tree does not hold.
     pub element_unresolved: bool,
+    /// A click at a point, and no element in the cached snapshot holds the point.
+    pub click_point_unresolved: bool,
     pub key: Option<String>,
     pub text_chars: Option<usize>,
     pub text_sha256: Option<String>,
@@ -430,6 +516,11 @@ impl ActionFacts {
         self
     }
 
+    pub(crate) fn with_unresolved_click_point(mut self) -> Self {
+        self.click_point_unresolved = true;
+        self
+    }
+
     pub(crate) fn with_key(mut self, key: &str) -> Self {
         self.key = Some(key.to_string());
         self
@@ -443,11 +534,13 @@ impl ActionFacts {
     }
 
     /// The shell command counts as text: the gate keeps length and digest.
-    /// A short preview is for the confirmation dialog only.
+    /// The full command is for the confirmation dialog only, and only when it
+    /// is short enough to read. The audit log never holds it.
     pub(crate) fn with_command(mut self, command: &str) -> Self {
-        self.text_chars = Some(command.chars().count());
+        let chars = command.chars().count();
+        self.text_chars = Some(chars);
         self.text_sha256 = Some(sha256_hex(command));
-        self.command_preview = Some(display_text(command, PROMPT_COMMAND_MAX_CHARS));
+        self.command_preview = (chars <= RUN_SHELL_PREVIEW_MAX_CHARS).then(|| command.to_string());
         self
     }
 
@@ -491,32 +584,61 @@ pub(crate) fn commit_word(text: &str) -> Option<&'static str> {
         })
 }
 
+/// The key part of a chord, lowercase, without hyphens, underscores, or
+/// spaces. This follows the key grammar of `press_key`: parts join with `+`.
+fn last_key_part(key: &str) -> Option<String> {
+    key.split('+')
+        .map(str::trim)
+        .rfind(|part| !part.is_empty())
+        .map(|last| last.to_ascii_lowercase().replace(['-', '_', ' '], ""))
+}
+
 /// True for Return, KP_Enter, or Enter with any modifiers. This follows the
 /// key grammar of `press_key` (parts joined with `+`, case-insensitive,
 /// hyphens and spaces ignored) and also accepts `KP_Enter` spellings.
 pub(crate) fn is_enter_key(key: &str) -> bool {
+    last_key_part(key).is_some_and(|last| {
+        matches!(
+            last.as_str(),
+            "enter" | "return" | "kpenter" | "numpadenter"
+        )
+    })
+}
+
+/// True for the space key with any modifiers. Space presses the focused
+/// button, link, or checkbox.
+pub(crate) fn is_space_key(key: &str) -> bool {
+    last_key_part(key).is_some_and(|last| last == "space")
+}
+
+/// True when the key part is one printable character, such as `a` or `7`,
+/// with any modifiers. An agent can send a password this way, key by key.
+pub(crate) fn is_single_printable_key(key: &str) -> bool {
     key.split('+')
         .map(str::trim)
         .rfind(|part| !part.is_empty())
         .is_some_and(|last| {
-            let normalized = last.to_ascii_lowercase().replace(['-', '_', ' '], "");
-            matches!(
-                normalized.as_str(),
-                "enter" | "return" | "kpenter" | "numpadenter"
-            )
+            let mut chars = last.chars();
+            matches!((chars.next(), chars.next()), (Some(c), None) if c.is_alphanumeric())
         })
 }
 
-/// The send-on-Enter entry that matches the window, if any. Entries are
-/// lowercase substrings of the app id, the wm class, or the title.
-pub(crate) fn send_app_match<'a>(facts: &ActionFacts, send_apps: &'a [String]) -> Option<&'a str> {
+/// True when the gate needs the focused element to rate this key: Enter and
+/// space can press a focused control, and a single character can type into a
+/// password field.
+pub(crate) fn key_needs_focus_check(key: &str) -> bool {
+    is_enter_key(key) || is_space_key(key) || is_single_printable_key(key)
+}
+
+/// The list entry that matches the window, if any. Entries are lowercase
+/// substrings of the app id, the wm class, or the title.
+fn app_list_match<'a>(facts: &ActionFacts, list: &'a [String]) -> Option<&'a str> {
     let fields = [
         facts.app_id.as_deref(),
         facts.wm_class.as_deref(),
         facts.window_title.as_deref(),
     ];
-    send_apps
-        .iter()
+    list.iter()
         .find(|entry| {
             fields
                 .iter()
@@ -526,26 +648,84 @@ pub(crate) fn send_app_match<'a>(facts: &ActionFacts, send_apps: &'a [String]) -
         .map(String::as_str)
 }
 
-/// Rate one call. Pure: it reads only `facts` and `send_apps`.
-pub(crate) fn classify(facts: &ActionFacts, send_apps: &[String]) -> Classification {
+/// The send-on-Enter entry that matches the window, if any.
+pub(crate) fn send_app_match<'a>(facts: &ActionFacts, send_apps: &'a [String]) -> Option<&'a str> {
+    app_list_match(facts, send_apps)
+}
+
+/// The terminal entry that matches the window, if any.
+pub(crate) fn terminal_app_match<'a>(
+    facts: &ActionFacts,
+    terminal_apps: &'a [String],
+) -> Option<&'a str> {
+    app_list_match(facts, terminal_apps)
+}
+
+/// First commit word in the name or the description of the element.
+fn element_commit_word(facts: &ActionFacts) -> Option<&'static str> {
+    [
+        facts.element_name.as_deref(),
+        facts.element_description.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(commit_word)
+}
+
+/// Rate a call that sends Enter, or text with a line break, to the window.
+/// A commit word on the focused element comes first. Then a terminal, a send
+/// app, and an unknown window give the reasons that the caller passes in.
+fn enter_rating(
+    facts: &ActionFacts,
+    lists: &AppLists,
+    in_terminal: Reason,
+    in_send_app: Reason,
+    in_unknown_window: Reason,
+) -> Option<Classification> {
+    if let Some(word) = element_commit_word(facts) {
+        return Some(Classification::high(Reason::CommitWord(word)));
+    }
+    if terminal_app_match(facts, &lists.terminal).is_some() {
+        return Some(Classification::high(in_terminal));
+    }
+    if send_app_match(facts, &lists.send).is_some() {
+        return Some(Classification::high(in_send_app));
+    }
+    if !facts.has_window() {
+        return Some(Classification::high(in_unknown_window));
+    }
+    None
+}
+
+/// Rate one call. Pure: it reads only `facts` and `lists`.
+pub(crate) fn classify(facts: &ActionFacts, lists: &AppLists) -> Classification {
     match facts.tool {
         "setup_accessibility" | "setup_window_targeting" => Classification::high(Reason::SetupTool),
-        "run_shell" => Classification::high(Reason::ShellCommand),
+        "run_shell" => {
+            if facts
+                .text_chars
+                .is_some_and(|chars| chars > RUN_SHELL_PREVIEW_MAX_CHARS)
+            {
+                return Classification::blocked(Reason::CommandTooLong);
+            }
+            Classification::high(Reason::ShellCommand)
+        }
         "click" | "perform_action" => {
-            let word = [
-                facts.element_name.as_deref(),
-                facts.element_description.as_deref(),
-            ]
-            .into_iter()
-            .flatten()
-            .find_map(commit_word);
-            if let Some(word) = word {
+            if let Some(word) = element_commit_word(facts) {
                 return Classification::high(Reason::CommitWord(word));
             }
             // A click that names a missing element fails inside the tool
             // without input, so only perform_action needs the unresolved rule.
             if facts.tool == "perform_action" && facts.element_unresolved {
                 return Classification::high(Reason::UnresolvedElement);
+            }
+            // A click at a point that no known control holds can still press
+            // a send button in a messaging app.
+            if facts.tool == "click"
+                && facts.click_point_unresolved
+                && send_app_match(facts, &lists.send).is_some()
+            {
+                return Classification::high(Reason::ClickInSendApp);
             }
             Classification::low()
         }
@@ -563,22 +743,40 @@ pub(crate) fn classify(facts: &ActionFacts, send_apps: &[String]) -> Classificat
                 return Classification::blocked(Reason::PasswordField);
             }
             if facts.text_has_newline {
-                if send_app_match(facts, send_apps).is_some() {
-                    return Classification::high(Reason::NewlineInSendApp);
-                }
-                if !facts.has_window() {
-                    return Classification::high(Reason::NewlineInUnknownWindow);
+                if let Some(rating) = enter_rating(
+                    facts,
+                    lists,
+                    Reason::NewlineInTerminal,
+                    Reason::NewlineInSendApp,
+                    Reason::NewlineInUnknownWindow,
+                ) {
+                    return rating;
                 }
             }
             Classification::low()
         }
         "press_key" => {
-            if facts.key.as_deref().is_some_and(is_enter_key) {
-                if send_app_match(facts, send_apps).is_some() {
-                    return Classification::high(Reason::EnterInSendApp);
+            let Some(key) = facts.key.as_deref() else {
+                return Classification::low();
+            };
+            // The role check fails open: with no accessibility data the
+            // role is unknown, and the key goes through.
+            if is_single_printable_key(key) && facts.element_is_password() {
+                return Classification::blocked(Reason::PasswordField);
+            }
+            if is_enter_key(key) {
+                if let Some(rating) = enter_rating(
+                    facts,
+                    lists,
+                    Reason::EnterInTerminal,
+                    Reason::EnterInSendApp,
+                    Reason::EnterInUnknownWindow,
+                ) {
+                    return rating;
                 }
-                if !facts.has_window() {
-                    return Classification::high(Reason::EnterInUnknownWindow);
+            } else if is_space_key(key) {
+                if let Some(word) = element_commit_word(facts) {
+                    return Classification::high(Reason::CommitWord(word));
                 }
             }
             Classification::low()
@@ -616,9 +814,14 @@ pub(crate) fn verdict(mode: Mode, tier: Tier) -> Verdict {
 // ---------------------------------------------------------------------------
 
 /// One audit line. The record holds no typed text: only length and digest.
+/// A call writes `start` and `end` lines, or one `refused` line. All lines of
+/// one call share the same `call_id`.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct AuditRecord {
     pub ts: String,
+    pub call_id: String,
+    /// `start`, `end`, or `refused`.
+    pub phase: &'static str,
     pub client: String,
     pub tool: String,
     pub mode: &'static str,
@@ -630,19 +833,24 @@ pub(crate) struct AuditRecord {
     pub key: Option<String>,
     pub text_len: Option<usize>,
     pub text_sha256: Option<String>,
-    pub ok: bool,
+    /// The result of the action. A `start` line has none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ok: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
 }
 
 impl AuditRecord {
-    fn new(client: &str, facts: &ActionFacts, mode: Mode, classification: &Classification) -> Self {
+    /// A record before the call has a rating. The tier is `unknown`.
+    fn new(call_id: &str, client: &str, facts: &ActionFacts, mode: Mode) -> Self {
         Self {
             ts: rfc3339_utc(SystemTime::now()),
+            call_id: call_id.to_string(),
+            phase: "start",
             client: truncate_chars(client, AUDIT_FIELD_MAX_CHARS),
             tool: facts.tool.to_string(),
             mode: mode.as_str(),
-            tier: classification.tier.as_str(),
+            tier: "unknown",
             decision: "pending",
             app: facts
                 .app()
@@ -658,9 +866,24 @@ impl AuditRecord {
             key: facts.key.as_deref().map(audit_key),
             text_len: facts.text_chars,
             text_sha256: facts.text_sha256.clone(),
-            ok: false,
-            reason: classification.reason.as_ref().map(Reason::code),
+            ok: None,
+            reason: None,
         }
+    }
+
+    fn classified(mut self, classification: &Classification) -> Self {
+        self.tier = classification.tier.as_str();
+        self.reason = classification.reason.as_ref().map(Reason::code);
+        self
+    }
+
+    /// A copy for one line of the log, with its own time.
+    fn stamped(&self, phase: &'static str, ok: Option<bool>) -> Self {
+        let mut line = self.clone();
+        line.ts = rfc3339_utc(SystemTime::now());
+        line.phase = phase;
+        line.ok = ok;
+        line
     }
 
     fn line(&self) -> String {
@@ -668,6 +891,20 @@ impl AuditRecord {
         line.push('\n');
         line
     }
+}
+
+/// An id that is unique for each call, across server processes.
+fn new_call_id() -> String {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    format!(
+        "{millis:x}-{:x}-{:x}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 /// A single plain character could be one letter of a password that an agent
@@ -896,6 +1133,22 @@ impl Prompter for SystemPrompter {
     }
 }
 
+/// Arguments for `zenity --question`. The cancel button has the default
+/// focus, so a stray Enter key denies the action and never allows it.
+fn zenity_args(text: &str, timeout: Duration) -> Vec<String> {
+    vec![
+        "--question".to_string(),
+        "--no-markup".to_string(),
+        "--default-cancel".to_string(),
+        "--title=take-my-computer".to_string(),
+        "--ok-label=Allow".to_string(),
+        "--cancel-label=Deny".to_string(),
+        "--width=440".to_string(),
+        format!("--timeout={}", timeout.as_secs().max(1)),
+        format!("--text={text}"),
+    ]
+}
+
 /// Ask with `zenity --question`. Only exit code 0 counts as approval.
 async fn run_zenity(text: &str, timeout: Duration) -> DialogOutcome {
     let has_display = ["WAYLAND_DISPLAY", "DISPLAY"]
@@ -906,14 +1159,7 @@ async fn run_zenity(text: &str, timeout: Duration) -> DialogOutcome {
     }
     let mut command = tokio::process::Command::new("zenity");
     command
-        .arg("--question")
-        .arg("--no-markup")
-        .arg("--title=take-my-computer")
-        .arg("--ok-label=Allow")
-        .arg("--cancel-label=Deny")
-        .arg("--width=440")
-        .arg(format!("--timeout={}", timeout.as_secs().max(1)))
-        .arg(format!("--text={text}"))
+        .args(zenity_args(text, timeout))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -940,6 +1186,41 @@ async fn run_zenity(text: &str, timeout: Duration) -> DialogOutcome {
             DialogOutcome::TimedOut
         }
     }
+}
+
+/// Characters that change how text looks but do not show: zero-width marks,
+/// soft hyphen, and the bidirectional controls.
+fn is_hidden_format_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00ad}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{feff}'
+    )
+}
+
+/// The lines of a shell command for the confirmation. Line breaks stay, so
+/// the user sees where each command starts. Control characters and hidden
+/// format characters show as escapes, so nothing in the command is invisible.
+fn command_display_lines(command: &str) -> Vec<String> {
+    command
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .split('\n')
+        .map(|line| {
+            line.chars()
+                .map(|c| match c {
+                    '\t' => "    ".to_string(),
+                    c if c.is_control() => format!("\\x{:02x}", c as u32),
+                    c if is_hidden_format_char(c) => format!("\\u{{{:04x}}}", c as u32),
+                    c => c.to_string(),
+                })
+                .collect()
+        })
+        .collect()
 }
 
 fn prompt_text(client: &str, facts: &ActionFacts, classification: &Classification) -> String {
@@ -976,8 +1257,15 @@ fn prompt_text(client: &str, facts: &ActionFacts, classification: &Classificatio
     if let Some(chars) = facts.text_chars {
         lines.push(format!("Text: {chars} characters (content hidden)"));
     }
-    if let Some(preview) = facts.command_preview.as_deref() {
-        lines.push(format!("Command: {preview}"));
+    if let Some(command) = facts.command_preview.as_deref() {
+        // Each line has a prefix, so a line of the command cannot pose as
+        // a line of this dialog.
+        lines.push("Command:".to_string());
+        lines.extend(
+            command_display_lines(command)
+                .into_iter()
+                .map(|line| format!("> {line}")),
+        );
     }
     if let Some(reason) = classification.reason.as_ref() {
         lines.push(format!("Why: {}", reason.describe()));
@@ -1004,8 +1292,9 @@ enum Confirmation {
 }
 
 /// Proof that the gate allowed a call. It holds the input lock. Call
-/// [`Permit::finish`] with the result to write the audit line. A permit that
-/// drops without `finish` (for example a cancelled call) writes `ok: false`.
+/// [`Permit::finish`] with the result to write the `end` audit line. A permit
+/// that drops without `finish` (for example a cancelled call) writes
+/// `ok: false`.
 #[derive(Debug)]
 pub(crate) struct Permit {
     _lock: InputLock,
@@ -1018,9 +1307,9 @@ impl Permit {
     }
 
     fn write_audit(&mut self, ok: bool) {
-        if let Some((mut file, mut record)) = self.audit.take() {
-            record.ok = ok;
-            if let Err(error) = append_audit(&mut file, &record) {
+        if let Some((mut file, record)) = self.audit.take() {
+            // The action is done. A failed write cannot undo it.
+            if let Err(error) = append_audit(&mut file, &record.stamped("end", Some(ok))) {
                 eprintln!("[take-my-computer] audit log write failed: {error}");
             }
         }
@@ -1031,6 +1320,127 @@ impl Drop for Permit {
     fn drop(&mut self) {
         self.write_audit(false);
     }
+}
+
+/// A call that holds the input lock and has not been decided yet. The caller
+/// reads the desktop facts while it holds this value, then calls
+/// [`Entry::decide`]. An entry that drops without a decision (for example a
+/// cancelled call) writes a `refused` line.
+#[derive(Debug)]
+pub(crate) struct Entry {
+    policy: Policy,
+    lock: Option<InputLock>,
+    call_id: String,
+    client: String,
+    base: ActionFacts,
+}
+
+impl Entry {
+    /// Rate the call and ask the user when it needs confirmation. On success
+    /// the audit `start` line is written and the caller may send input.
+    pub(crate) async fn decide(
+        mut self,
+        facts: ActionFacts,
+        prompter: &dyn Prompter,
+    ) -> Result<Permit, Refusal> {
+        let policy = self.policy.clone();
+        let config = policy.config();
+        let classification = classify(&facts, &config.apps);
+        let mut record = AuditRecord::new(&self.call_id, &self.client, &facts, config.mode)
+            .classified(&classification);
+
+        // The kill switch may turn on while the call waits for the lock.
+        if config.kill_switch_active() {
+            return Err(self.refuse(record, "refused", policy.kill_switch_message()));
+        }
+
+        let mut decision = "allowed";
+        match verdict(config.mode, classification.tier) {
+            Verdict::Allow => {}
+            Verdict::Refuse(RefuseCause::Observe) => {
+                let message = observe_message(facts.tool);
+                return Err(self.refuse(record, "refused", message));
+            }
+            Verdict::Refuse(RefuseCause::Blocked) => {
+                let message = format!(
+                    "Refused by the safety policy: {} The mode is confirm. Mode full (TAKE_MY_COMPUTER_POLICY=full) allows it.",
+                    classification
+                        .reason
+                        .as_ref()
+                        .map(Reason::describe)
+                        .unwrap_or_default()
+                );
+                return Err(self.refuse(record, "refused", message));
+            }
+            Verdict::Confirm => {
+                match policy
+                    .confirm(&facts, &classification, &self.client, prompter)
+                    .await
+                {
+                    Confirmation::Approved => decision = "confirmed",
+                    Confirmation::Denied(message) => {
+                        return Err(self.refuse(record, "denied", message));
+                    }
+                    Confirmation::Unavailable(message) => {
+                        return Err(self.refuse(record, "refused", message));
+                    }
+                }
+            }
+        }
+        // The user may press the kill switch while a dialog is open.
+        if config.kill_switch_active() {
+            return Err(self.refuse(record, "refused", policy.kill_switch_message()));
+        }
+        record.decision = decision;
+        // The start line goes in before any input. If it fails, no input is sent.
+        let audit_failure = |error: std::io::Error| {
+            format!(
+                "Refused: the audit log cannot be written ({}): {error}. No input was sent.",
+                config.audit_path().display()
+            )
+        };
+        let mut file = match open_audit(config) {
+            Ok(file) => file,
+            Err(error) => return Err(self.refuse(record, "refused", audit_failure(error))),
+        };
+        if let Err(error) = append_audit(&mut file, &record.stamped("start", None)) {
+            return Err(self.refuse(record, "refused", audit_failure(error)));
+        }
+        let lock = self
+            .lock
+            .take()
+            .expect("an entry holds the lock until decided");
+        Ok(Permit {
+            _lock: lock,
+            audit: Some((file, record)),
+        })
+    }
+
+    /// Write the `refused` line, release the lock, and build the refusal.
+    fn refuse(&mut self, record: AuditRecord, decision: &'static str, message: String) -> Refusal {
+        self.lock = None;
+        self.policy.refuse(record, decision, message)
+    }
+}
+
+impl Drop for Entry {
+    fn drop(&mut self) {
+        if self.lock.is_some() {
+            let record = AuditRecord::new(
+                &self.call_id,
+                &self.client,
+                &self.base,
+                self.policy.config().mode,
+            );
+            self.policy.write_refused(record, "cancelled");
+        }
+    }
+}
+
+fn observe_message(tool: &str) -> String {
+    format!(
+        "Refused by the safety policy: the mode is observe, so {tool} does not run. Read-only tools still work. Mode confirm or full (TAKE_MY_COMPUTER_POLICY) allows this tool."
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -1086,89 +1496,57 @@ impl Policy {
             mode_env: POLICY_ENV.to_string(),
             kill_switch_active: self.config.kill_switch_active(),
             kill_switch_file: self.config.stop_file().display().to_string(),
-            send_on_enter_apps: self.config.send_apps.clone(),
+            send_on_enter_apps: self.config.apps.send.clone(),
+            terminal_apps: self.config.apps.terminal.clone(),
             audit_log: self.config.audit_path().display().to_string(),
             confirmation_channels: channels,
             warning: self.config.warning.clone(),
         }
     }
 
-    /// Decide one call. On success the caller holds the returned [`Permit`]
-    /// for the whole call. On refusal no input may be sent.
+    /// Start one call. This is the first step of the gate. It refuses at once
+    /// for the kill switch and the `observe` mode. Otherwise it waits for the
+    /// input lock. The caller holds the lock until the action and its audit
+    /// line are done, so no other call can send input while a dialog is open.
+    /// `base` holds what the caller knows before it reads the desktop. It is
+    /// for the audit line of a refusal.
+    pub(crate) async fn enter(&self, base: &ActionFacts, client: &str) -> Result<Entry, Refusal> {
+        let config = &self.config;
+        let call_id = new_call_id();
+        let record = AuditRecord::new(&call_id, client, base, config.mode);
+
+        if config.kill_switch_active() {
+            return Err(self.refuse(record, "refused", self.kill_switch_message()));
+        }
+        if config.mode == Mode::Observe {
+            return Err(self.refuse(record, "refused", observe_message(base.tool)));
+        }
+        let lock = match acquire_input_lock(&config.lock_path, config.lock_timeout).await {
+            Ok(lock) => lock,
+            Err(message) => return Err(self.refuse(record, "refused", message)),
+        };
+        Ok(Entry {
+            policy: self.clone(),
+            lock: Some(lock),
+            call_id,
+            client: client.to_string(),
+            base: base.clone(),
+        })
+    }
+
+    /// Decide a call whose facts are known at once. Unit tests use it. The
+    /// server reads desktop facts between [`Policy::enter`] and [`Entry::decide`].
+    #[cfg(test)]
     pub(crate) async fn begin(
         &self,
         facts: ActionFacts,
         client: &str,
         prompter: &dyn Prompter,
     ) -> Result<Permit, Refusal> {
-        let config = &self.config;
-        let classification = classify(&facts, &config.send_apps);
-        let mut record = AuditRecord::new(client, &facts, config.mode, &classification);
-
-        if config.kill_switch_active() {
-            return Err(self.refuse(record, "refused", self.kill_switch_message()));
-        }
-
-        let mut decision = "allowed";
-        match verdict(config.mode, classification.tier) {
-            Verdict::Allow => {}
-            Verdict::Refuse(RefuseCause::Observe) => {
-                let message = format!(
-                    "Refused by the safety policy: the mode is observe, so {} does not run. Read-only tools still work. Mode confirm or full (TAKE_MY_COMPUTER_POLICY) allows this tool.",
-                    facts.tool
-                );
-                return Err(self.refuse(record, "refused", message));
-            }
-            Verdict::Refuse(RefuseCause::Blocked) => {
-                let message = format!(
-                    "Refused by the safety policy: {} The mode is confirm. Mode full (TAKE_MY_COMPUTER_POLICY=full) allows it.",
-                    classification
-                        .reason
-                        .as_ref()
-                        .map(Reason::describe)
-                        .unwrap_or_default()
-                );
-                return Err(self.refuse(record, "refused", message));
-            }
-            Verdict::Confirm => {
-                match self
-                    .confirm(&facts, &classification, client, prompter)
-                    .await
-                {
-                    Confirmation::Approved => decision = "confirmed",
-                    Confirmation::Denied(message) => {
-                        return Err(self.refuse(record, "denied", message));
-                    }
-                    Confirmation::Unavailable(message) => {
-                        return Err(self.refuse(record, "refused", message));
-                    }
-                }
-            }
-        }
-
-        let lock = match acquire_input_lock(&config.lock_path, config.lock_timeout).await {
-            Ok(lock) => lock,
-            Err(message) => return Err(self.refuse(record, "refused", message)),
-        };
-        // The user may press the kill switch while a dialog or the lock waits.
-        if config.kill_switch_active() {
-            return Err(self.refuse(record, "refused", self.kill_switch_message()));
-        }
-        let file = match open_audit(config) {
-            Ok(file) => file,
-            Err(error) => {
-                let message = format!(
-                    "Refused: the audit log cannot be written ({}): {error}. No input was sent.",
-                    config.audit_path().display()
-                );
-                return Err(self.refuse(record, "refused", message));
-            }
-        };
-        record.decision = decision;
-        Ok(Permit {
-            _lock: lock,
-            audit: Some((file, record)),
-        })
+        self.enter(&facts, client)
+            .await?
+            .decide(facts, prompter)
+            .await
     }
 
     fn kill_switch_message(&self) -> String {
@@ -1179,18 +1557,22 @@ impl Policy {
     }
 
     /// Write the audit line for a refused call and build the refusal.
-    fn refuse(&self, mut record: AuditRecord, decision: &'static str, message: String) -> Refusal {
+    fn refuse(&self, record: AuditRecord, decision: &'static str, message: String) -> Refusal {
+        self.write_refused(record, decision);
+        Refusal { message }
+    }
+
+    fn write_refused(&self, mut record: AuditRecord, decision: &'static str) {
         record.decision = decision;
-        record.ok = false;
+        let line = record.stamped("refused", Some(false));
         match open_audit(&self.config) {
             Ok(mut file) => {
-                if let Err(error) = append_audit(&mut file, &record) {
+                if let Err(error) = append_audit(&mut file, &line) {
                     eprintln!("[take-my-computer] audit log write failed: {error}");
                 }
             }
             Err(error) => eprintln!("[take-my-computer] audit log open failed: {error}"),
         }
-        Refusal { message }
     }
 
     async fn confirm(
@@ -1255,6 +1637,8 @@ pub(crate) struct PolicyStatus {
     pub kill_switch_file: String,
     /// Case-insensitive substrings of app id, wm class, or title.
     pub send_on_enter_apps: Vec<String>,
+    /// Terminal apps, where Enter runs a shell command. Same matching.
+    pub terminal_apps: Vec<String>,
     pub audit_log: String,
     /// Channels for confirmation, in order of use.
     pub confirmation_channels: Vec<String>,
@@ -1276,11 +1660,11 @@ fn executable_in_path(program: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Mutex;
 
-    fn apps() -> Vec<String> {
-        parse_send_apps(None)
+    fn apps() -> AppLists {
+        AppLists::default()
     }
 
     fn facts(tool: &'static str) -> ActionFacts {
@@ -1499,8 +1883,14 @@ mod tests {
 
     #[test]
     fn send_app_override_replaces_the_default_list() {
-        let custom = parse_send_apps(Some(" Mattermost , ,ZULIP "));
-        assert_eq!(custom, vec!["mattermost".to_string(), "zulip".to_string()]);
+        let custom = AppLists {
+            send: parse_send_apps(Some(" Mattermost , ,ZULIP ")),
+            ..apps()
+        };
+        assert_eq!(
+            custom.send,
+            vec!["mattermost".to_string(), "zulip".to_string()]
+        );
         let in_custom = in_window("press_key", "Mattermost", "Town Square").with_key("Enter");
         assert_eq!(classify(&in_custom, &custom).tier, Tier::High);
         let in_old_default = in_window("press_key", "slack", "Slack").with_key("Enter");
@@ -1509,9 +1899,9 @@ mod tests {
 
     #[test]
     fn empty_send_app_override_keeps_the_default_list() {
-        assert_eq!(parse_send_apps(Some("")), apps());
-        assert_eq!(parse_send_apps(Some(" , ")), apps());
-        assert_eq!(apps().len(), DEFAULT_SEND_APPS.len());
+        assert_eq!(parse_send_apps(Some("")), apps().send);
+        assert_eq!(parse_send_apps(Some(" , ")), apps().send);
+        assert_eq!(apps().send.len(), DEFAULT_SEND_APPS.len());
     }
 
     #[test]
@@ -1562,6 +1952,407 @@ mod tests {
         ] {
             assert_eq!(classify(&facts(tool), &apps()).tier, Tier::Low, "{tool}");
         }
+    }
+
+    // ----- terminal apps -----
+
+    #[test]
+    fn terminal_app_list_has_a_default_and_an_override() {
+        let defaults = parse_terminal_apps(None);
+        assert_eq!(defaults.len(), DEFAULT_TERMINAL_APPS.len());
+        for name in [
+            "gnome-terminal",
+            "kgx",
+            "ptyxis",
+            "console",
+            "konsole",
+            "kitty",
+            "alacritty",
+            "foot",
+            "wezterm",
+            "xterm",
+            "tilix",
+            "terminator",
+            "ghostty",
+            "terminal",
+        ] {
+            assert!(defaults.iter().any(|entry| entry == name), "{name}");
+        }
+        assert_eq!(
+            parse_terminal_apps(Some(" Warp , ,ROXTERM ")),
+            vec!["warp".to_string(), "roxterm".to_string()]
+        );
+        // An empty override must not turn the check off.
+        assert_eq!(parse_terminal_apps(Some("")), defaults);
+        assert_eq!(parse_terminal_apps(Some(" , ")), defaults);
+    }
+
+    #[test]
+    fn terminal_override_comes_from_its_own_variable() {
+        let config = PolicyConfig::from_lookup(|name| {
+            (name == TERMINAL_APPS_ENV).then(|| "Warp".to_string())
+        });
+        assert_eq!(config.apps.terminal, vec!["warp".to_string()]);
+        assert_eq!(config.apps.send, parse_send_apps(None));
+        let status = Policy::new(config).status(false);
+        assert_eq!(status.terminal_apps, vec!["warp".to_string()]);
+    }
+
+    #[test]
+    fn enter_in_a_terminal_is_high_for_every_enter_spelling() {
+        for (app, title) in [
+            ("gnome-terminal-server", "Terminal"),
+            ("org.gnome.Console", "Console"),
+            ("org.gnome.Ptyxis", "Ptyxis"),
+            ("org.kde.konsole", "Konsole"),
+            ("kitty", "kitty"),
+            ("Alacritty", "Alacritty"),
+            ("foot", "foot"),
+            ("org.wezfurlong.wezterm", "WezTerm"),
+            ("XTerm", "xterm"),
+            ("com.gexperts.Tilix", "Tilix"),
+            ("terminator", "Terminator"),
+            ("com.mitchellh.ghostty", "Ghostty"),
+        ] {
+            for key in ["Enter", "Return", "KP_Enter", "Ctrl+Enter", "Shift+Return"] {
+                let cls = classify(&in_window("press_key", app, title).with_key(key), &apps());
+                assert_eq!(cls.tier, Tier::High, "{app} {key}");
+                assert_eq!(cls.reason, Some(Reason::EnterInTerminal), "{app} {key}");
+            }
+            let typed = in_window("type_text", app, title).with_text("ls\n");
+            let cls = classify(&typed, &apps());
+            assert_eq!(cls.reason, Some(Reason::NewlineInTerminal), "{app}");
+        }
+    }
+
+    #[test]
+    fn terminal_match_reads_wm_class_and_title_too() {
+        let by_class = ActionFacts::new("press_key")
+            .with_window(None, Some("Kitty"), Some("untitled"))
+            .with_key("Enter");
+        assert_eq!(classify(&by_class, &apps()).tier, Tier::High);
+        let by_title = ActionFacts::new("press_key")
+            .with_window(Some("org.example"), None, Some("user@host: ~ - Terminal"))
+            .with_key("Enter");
+        assert_eq!(
+            classify(&by_title, &apps()).reason,
+            Some(Reason::EnterInTerminal)
+        );
+    }
+
+    #[test]
+    fn a_terminal_override_replaces_the_default_list() {
+        let custom = AppLists {
+            terminal: parse_terminal_apps(Some("warp")),
+            ..apps()
+        };
+        let in_warp = in_window("press_key", "dev.warp.Warp", "Warp").with_key("Enter");
+        assert_eq!(
+            classify(&in_warp, &custom).reason,
+            Some(Reason::EnterInTerminal)
+        );
+        let in_kitty = in_window("press_key", "kitty", "kitty").with_key("Enter");
+        assert_eq!(classify(&in_kitty, &custom).tier, Tier::Low);
+        assert_eq!(classify(&in_kitty, &custom).reason, None);
+    }
+
+    #[test]
+    fn typing_without_a_line_break_or_other_keys_in_a_terminal_is_low() {
+        let plain = in_window("type_text", "kitty", "kitty").with_text("ls -la");
+        assert_eq!(classify(&plain, &apps()).tier, Tier::Low);
+        for key in ["Tab", "Escape", "Ctrl+L", "Up", "a"] {
+            let cls = classify(
+                &in_window("press_key", "kitty", "kitty").with_key(key),
+                &apps(),
+            );
+            assert_eq!(cls.tier, Tier::Low, "{key}");
+        }
+    }
+
+    #[test]
+    fn enter_with_an_unknown_window_is_high_for_every_enter_spelling() {
+        for key in ["Enter", "Return", "KP_Enter", "Ctrl+Return"] {
+            let cls = classify(&facts("press_key").with_key(key), &apps());
+            assert_eq!(cls.reason, Some(Reason::EnterInUnknownWindow), "{key}");
+        }
+        let typed = classify(&facts("type_text").with_text("a\nb"), &apps());
+        assert_eq!(typed.reason, Some(Reason::NewlineInUnknownWindow));
+    }
+
+    // ----- keyboard activation of a control -----
+
+    #[test]
+    fn space_key_is_recognised_with_any_modifier() {
+        for key in ["space", "Space", "SPACE", "Ctrl+space", "shift + Space"] {
+            assert!(is_space_key(key), "{key}");
+        }
+        for key in ["Enter", "a", "Ctrl+L", "Spacebar2", "space+Tab", ""] {
+            assert!(!is_space_key(key), "{key}");
+        }
+    }
+
+    #[test]
+    fn enter_and_space_on_a_commit_control_are_high() {
+        for key in [
+            "Return",
+            "Enter",
+            "KP_Enter",
+            "space",
+            "Ctrl+Return",
+            "Shift+space",
+        ] {
+            for name in ["Send", "Delete account", "Kirim pesan"] {
+                let facts = in_window("press_key", "gedit", "notes")
+                    .with_element(Some("push button"), Some(name), None)
+                    .with_key(key);
+                let cls = classify(&facts, &apps());
+                assert_eq!(cls.tier, Tier::High, "{key} {name}");
+                assert!(
+                    matches!(cls.reason, Some(Reason::CommitWord(_))),
+                    "{key} {name}"
+                );
+            }
+        }
+        let by_description = in_window("press_key", "gedit", "notes")
+            .with_element(Some("push button"), Some("Go"), Some("Pay now"))
+            .with_key("space");
+        assert_eq!(
+            classify(&by_description, &apps()).reason,
+            Some(Reason::CommitWord("pay"))
+        );
+    }
+
+    #[test]
+    fn enter_and_space_on_a_harmless_control_stay_low_outside_special_apps() {
+        for key in ["Return", "space"] {
+            let facts = in_window("press_key", "gedit", "notes")
+                .with_element(Some("push button"), Some("Open"), None)
+                .with_key(key);
+            assert_eq!(classify(&facts, &apps()).tier, Tier::Low, "{key}");
+        }
+    }
+
+    #[test]
+    fn other_keys_on_a_commit_control_stay_low() {
+        for key in ["Tab", "Escape", "a", "Ctrl+L", "Down"] {
+            let facts = in_window("press_key", "gedit", "notes")
+                .with_element(Some("push button"), Some("Send"), None)
+                .with_key(key);
+            assert_eq!(classify(&facts, &apps()).tier, Tier::Low, "{key}");
+        }
+    }
+
+    #[test]
+    fn a_line_break_on_a_commit_control_is_high_for_type_text() {
+        let facts = in_window("type_text", "gedit", "notes")
+            .with_element(Some("push button"), Some("Submit"), None)
+            .with_text("ok\n");
+        let cls = classify(&facts, &apps());
+        assert_eq!(cls.reason, Some(Reason::CommitWord("submit")));
+        // Text with no line break does not activate the control.
+        let one_line = in_window("type_text", "gedit", "notes")
+            .with_element(Some("text"), Some("Send to"), None)
+            .with_text("ok");
+        assert_eq!(classify(&one_line, &apps()).tier, Tier::Low);
+    }
+
+    #[test]
+    fn key_focus_check_covers_enter_space_and_single_characters() {
+        for key in [
+            "Enter",
+            "Return",
+            "space",
+            "a",
+            "7",
+            "Ctrl+a",
+            "Shift+Return",
+        ] {
+            assert!(key_needs_focus_check(key), "{key}");
+        }
+        for key in ["Tab", "Escape", "F5", "Up", "Ctrl", "Ctrl+Shift+Tab", ""] {
+            assert!(!key_needs_focus_check(key), "{key}");
+        }
+    }
+
+    // ----- password field by single keys -----
+
+    #[test]
+    fn single_printable_keys_are_recognised() {
+        for key in ["a", "Z", "7", "Shift+a", "Ctrl+7"] {
+            assert!(is_single_printable_key(key), "{key}");
+        }
+        for key in [
+            "Enter", "Tab", "F5", "Space", "Ctrl", "ab", "", "+", "Ctrl+Tab",
+        ] {
+            assert!(!is_single_printable_key(key), "{key}");
+        }
+    }
+
+    #[test]
+    fn single_keys_in_a_password_field_are_blocked() {
+        for key in ["a", "7", "Shift+a"] {
+            let facts = in_window("press_key", "firefox", "Login")
+                .with_element(Some("password text"), Some("Password"), None)
+                .with_key(key);
+            let cls = classify(&facts, &apps());
+            assert_eq!(cls.tier, Tier::Blocked, "{key}");
+            assert_eq!(cls.reason, Some(Reason::PasswordField), "{key}");
+        }
+    }
+
+    #[test]
+    fn named_keys_in_a_password_field_are_not_blocked() {
+        for key in ["Tab", "Escape", "Backspace", "Ctrl+Tab"] {
+            let facts = in_window("press_key", "firefox", "Login")
+                .with_element(Some("password text"), Some("Password"), None)
+                .with_key(key);
+            assert_eq!(classify(&facts, &apps()).tier, Tier::Low, "{key}");
+        }
+    }
+
+    #[test]
+    fn single_keys_pass_when_the_role_is_unknown() {
+        // Fail open: with no accessibility data, nothing shows a password field.
+        let unknown = in_window("press_key", "firefox", "Login").with_key("a");
+        assert_eq!(classify(&unknown, &apps()).tier, Tier::Low);
+        let other_role = in_window("press_key", "firefox", "Login")
+            .with_element(Some("text"), Some("Password hint"), None)
+            .with_key("a");
+        assert_eq!(classify(&other_role, &apps()).tier, Tier::Low);
+    }
+
+    #[test]
+    fn password_single_keys_are_refused_in_confirm_mode_only() {
+        assert_eq!(
+            verdict(Mode::Confirm, Tier::Blocked),
+            Verdict::Refuse(RefuseCause::Blocked)
+        );
+        assert_eq!(verdict(Mode::Full, Tier::Blocked), Verdict::Allow);
+    }
+
+    // ----- coordinate clicks -----
+
+    #[test]
+    fn coordinate_click_on_a_commit_control_is_high() {
+        // The server hit-tests the point and passes the element it found.
+        let facts = in_window("click", "gedit", "notes").with_element(
+            Some("push button"),
+            Some("Send"),
+            None,
+        );
+        assert_eq!(
+            classify(&facts, &apps()).reason,
+            Some(Reason::CommitWord("send"))
+        );
+    }
+
+    #[test]
+    fn coordinate_click_with_no_known_control_is_high_in_a_send_app_only() {
+        let in_chat =
+            in_window("click", "org.telegram.desktop", "Chat").with_unresolved_click_point();
+        let cls = classify(&in_chat, &apps());
+        assert_eq!(cls.tier, Tier::High);
+        assert_eq!(cls.reason, Some(Reason::ClickInSendApp));
+        assert_eq!(cls.reason.as_ref().unwrap().code(), "click_in_send_app");
+
+        let in_editor = in_window("click", "gedit", "notes").with_unresolved_click_point();
+        assert_eq!(classify(&in_editor, &apps()).tier, Tier::Low);
+        // An unknown window keeps the current rating.
+        let unknown = facts("click").with_unresolved_click_point();
+        assert_eq!(classify(&unknown, &apps()).tier, Tier::Low);
+    }
+
+    #[test]
+    fn coordinate_click_on_a_harmless_control_in_a_send_app_stays_low() {
+        let facts = in_window("click", "org.telegram.desktop", "Chat").with_element(
+            Some("push button"),
+            Some("Attach"),
+            None,
+        );
+        assert_eq!(classify(&facts, &apps()).tier, Tier::Low);
+    }
+
+    #[test]
+    fn an_element_click_never_takes_the_unresolved_point_rule() {
+        let facts = in_window("perform_action", "org.telegram.desktop", "Chat")
+            .with_unresolved_click_point();
+        assert_eq!(classify(&facts, &apps()).tier, Tier::Low);
+    }
+
+    // ----- run_shell -----
+
+    #[test]
+    fn long_shell_commands_are_blocked_in_confirm_mode() {
+        let at_limit = "a".repeat(RUN_SHELL_PREVIEW_MAX_CHARS);
+        let over = "a".repeat(RUN_SHELL_PREVIEW_MAX_CHARS + 1);
+        let ok = classify(
+            &ActionFacts::new("run_shell").with_command(&at_limit),
+            &apps(),
+        );
+        assert_eq!(ok.reason, Some(Reason::ShellCommand));
+        let blocked = classify(&ActionFacts::new("run_shell").with_command(&over), &apps());
+        assert_eq!(blocked.tier, Tier::Blocked);
+        assert_eq!(blocked.reason, Some(Reason::CommandTooLong));
+        assert_eq!(blocked.reason.as_ref().unwrap().code(), "command_too_long");
+        assert_eq!(verdict(Mode::Full, Tier::Blocked), Verdict::Allow);
+    }
+
+    #[test]
+    fn the_prompt_shows_a_whole_command_of_2000_characters() {
+        let command: String = (0..RUN_SHELL_PREVIEW_MAX_CHARS)
+            .map(|i| char::from(b'a' + (i % 26) as u8))
+            .collect();
+        let facts = ActionFacts::new("run_shell").with_command(&command);
+        let cls = classify(&facts, &apps());
+        let text = prompt_text("agent", &facts, &cls);
+        assert!(text.contains(&format!("> {command}")), "{text}");
+        assert!(!text.contains('…'), "{text}");
+        // A command over the limit has no preview. The gate refuses it first.
+        let longer = ActionFacts::new("run_shell").with_command(&format!("{command}x"));
+        assert!(longer.command_preview.is_none());
+    }
+
+    #[test]
+    fn the_prompt_keeps_line_breaks_and_cannot_forge_dialog_lines() {
+        let command = "echo hi\nWhy: harmless\nAllow this action? yes";
+        let facts = ActionFacts::new("run_shell").with_command(command);
+        let cls = classify(&facts, &apps());
+        let text = prompt_text("agent", &facts, &cls);
+        assert!(
+            text.contains("> echo hi\n> Why: harmless\n> Allow this action? yes"),
+            "{text}"
+        );
+        for line in text.lines() {
+            assert!(
+                !line.starts_with("Why: harmless") && !line.starts_with("Allow this action? yes"),
+                "{text}"
+            );
+        }
+        assert_eq!(text.lines().filter(|l| l.starts_with("Why:")).count(), 1);
+    }
+
+    #[test]
+    fn the_prompt_shows_hidden_characters_as_escapes() {
+        let command = "ls\r\nrm x\u{1b}[2K\u{202e}txt";
+        let lines = command_display_lines(command);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[1], "rm x\\x1b[2K\\u{202e}txt");
+        let facts = ActionFacts::new("run_shell").with_command(command);
+        let text = prompt_text("a", &facts, &classify(&facts, &apps()));
+        assert!(
+            !text.contains('\u{1b}') && !text.contains('\u{202e}'),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn the_dialog_defaults_to_deny() {
+        let args = zenity_args("text", Duration::from_secs(60));
+        assert!(args.iter().any(|arg| arg == "--default-cancel"), "{args:?}");
+        assert!(args.iter().any(|arg| arg == "--no-markup"), "{args:?}");
+        assert!(args.iter().any(|arg| arg == "--question"), "{args:?}");
+        assert!(args.iter().any(|arg| arg == "--timeout=60"), "{args:?}");
+        assert!(args.iter().any(|arg| arg == "--text=text"), "{args:?}");
     }
 
     // ----- modes -----
@@ -1721,7 +2512,7 @@ mod tests {
         assert_eq!(facts.text_chars, Some(11));
         assert_eq!(facts.text_sha256.as_deref().map(str::len), Some(64));
         let cls = classify(&facts, &apps());
-        assert!(prompt_text("a", &facts, &cls).contains("Command: ls -la /tmp"));
+        assert!(prompt_text("a", &facts, &cls).contains("Command:\n> ls -la /tmp"));
     }
 
     // ----- gate -----
@@ -1774,6 +2565,9 @@ mod tests {
         ) -> BoxFuture<'a, ElicitOutcome> {
             self.elicit_calls.fetch_add(1, Ordering::SeqCst);
             *self.last_text.lock().unwrap() = message.to_string();
+            if let Some(hook) = &self.during_dialog {
+                hook();
+            }
             let outcome = self.elicit.clone().expect("elicitation is not declared");
             Box::pin(async move { outcome })
         }
@@ -1827,6 +2621,20 @@ mod tests {
             .collect()
     }
 
+    /// `phase:decision` of every audit line, in order.
+    fn decisions_by_phase(policy: &Policy) -> Vec<String> {
+        audit_lines(policy)
+            .iter()
+            .map(|line| {
+                format!(
+                    "{}:{}",
+                    line["phase"].as_str().unwrap(),
+                    line["decision"].as_str().unwrap()
+                )
+            })
+            .collect()
+    }
+
     fn click_send() -> ActionFacts {
         in_window("click", "org.telegram.desktop", "Chat").with_element(
             Some("push button"),
@@ -1849,8 +2657,12 @@ mod tests {
 
         assert_eq!(prompter.calls(), (0, 0));
         let lines = audit_lines(&policy);
-        assert_eq!(lines.len(), 1);
-        let line = &lines[0];
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0]["phase"], "start");
+        assert!(lines[0].get("ok").is_none());
+        assert_eq!(lines[1]["phase"], "end");
+        assert_eq!(lines[0]["call_id"], lines[1]["call_id"]);
+        let line = &lines[1];
         assert_eq!(line["tool"], "type_text");
         assert_eq!(line["mode"], "full");
         assert_eq!(line["tier"], "blocked");
@@ -1879,34 +2691,39 @@ mod tests {
             .await
             .unwrap()
             .finish(true);
-        let line = &audit_lines(&policy)[0];
-        let mut keys: Vec<&str> = line
-            .as_object()
-            .unwrap()
-            .keys()
-            .map(String::as_str)
-            .collect();
-        keys.sort_unstable();
-        assert_eq!(
-            keys,
-            [
-                "app",
-                "client",
-                "decision",
-                "element_name",
-                "key",
-                "mode",
-                "ok",
-                "text_len",
-                "text_sha256",
-                "tier",
-                "tool",
-                "ts",
-                "window_title",
-            ]
-        );
-        assert_eq!(line["key"], "Ctrl+<char>");
-        assert!(line["text_len"].is_null());
+        let lines = audit_lines(&policy);
+        assert_eq!(lines.len(), 2);
+        let field_names = |line: &serde_json::Value| {
+            let mut keys: Vec<String> = line.as_object().unwrap().keys().cloned().collect();
+            keys.sort_unstable();
+            keys
+        };
+        let common = [
+            "app",
+            "call_id",
+            "client",
+            "decision",
+            "element_name",
+            "key",
+            "mode",
+            "phase",
+            "text_len",
+            "text_sha256",
+            "tier",
+            "tool",
+            "ts",
+            "window_title",
+        ];
+        // The start line has no result yet. The end line adds `ok`.
+        assert_eq!(field_names(&lines[0]), common);
+        let mut with_ok = common.to_vec();
+        with_ok.push("ok");
+        with_ok.sort_unstable();
+        assert_eq!(field_names(&lines[1]), with_ok);
+        for line in &lines {
+            assert_eq!(line["key"], "Ctrl+<char>");
+            assert!(line["text_len"].is_null());
+        }
     }
 
     #[tokio::test]
@@ -1919,9 +2736,11 @@ mod tests {
             .unwrap();
         drop(permit);
         let lines = audit_lines(&policy);
-        assert_eq!(lines.len(), 1);
-        assert_eq!(lines[0]["ok"], false);
-        assert_eq!(lines[0]["decision"], "allowed");
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0]["phase"], "start");
+        assert_eq!(lines[1]["phase"], "end");
+        assert_eq!(lines[1]["ok"], false);
+        assert_eq!(lines[1]["decision"], "allowed");
     }
 
     #[tokio::test]
@@ -1943,6 +2762,7 @@ mod tests {
         let lines = audit_lines(&policy);
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0]["decision"], "refused");
+        assert_eq!(lines[0]["phase"], "refused");
         assert_eq!(lines[0]["mode"], "observe");
         assert_eq!(lines[0]["ok"], false);
     }
@@ -1987,7 +2807,9 @@ mod tests {
         );
         assert_eq!(prompter.calls(), (0, 1));
         let lines = audit_lines(&policy);
+        assert_eq!(lines.len(), 1);
         assert_eq!(lines[0]["decision"], "refused");
+        assert_eq!(lines[0]["phase"], "refused");
         assert_eq!(lines[0]["tier"], "high");
         assert_eq!(lines[0]["reason"], "commit_word:send");
     }
@@ -2016,11 +2838,15 @@ mod tests {
         );
         assert_eq!(silent.calls(), (1, 0));
 
-        let decisions: Vec<String> = audit_lines(&policy)
-            .iter()
-            .map(|line| line["decision"].as_str().unwrap().to_string())
-            .collect();
-        assert_eq!(decisions, ["confirmed", "denied", "denied"]);
+        assert_eq!(
+            decisions_by_phase(&policy),
+            [
+                "start:confirmed",
+                "end:confirmed",
+                "refused:denied",
+                "refused:denied"
+            ]
+        );
     }
 
     #[tokio::test]
@@ -2035,6 +2861,7 @@ mod tests {
         permit.finish(true);
         assert_eq!(prompter.calls(), (1, 1));
         assert_eq!(audit_lines(&policy)[0]["decision"], "confirmed");
+        assert_eq!(audit_lines(&policy)[0]["phase"], "start");
     }
 
     #[tokio::test]
@@ -2061,11 +2888,15 @@ mod tests {
             refusal.message
         );
 
-        let decisions: Vec<String> = audit_lines(&policy)
-            .iter()
-            .map(|line| line["decision"].as_str().unwrap().to_string())
-            .collect();
-        assert_eq!(decisions, ["confirmed", "denied", "denied"]);
+        assert_eq!(
+            decisions_by_phase(&policy),
+            [
+                "start:confirmed",
+                "end:confirmed",
+                "refused:denied",
+                "refused:denied"
+            ]
+        );
     }
 
     #[tokio::test]
@@ -2206,6 +3037,439 @@ mod tests {
         assert_eq!(mode(policy.config().lock_path.parent().unwrap()), 0o700);
     }
 
+    // ----- lock order and audit phases -----
+
+    /// True when no other holder has the lock. The check takes the lock and
+    /// drops it again at once.
+    fn lock_is_free(path: &Path) -> bool {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(path)
+            .unwrap();
+        // SAFETY: flock only reads the descriptor, which `file` keeps open.
+        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
+    }
+
+    #[tokio::test]
+    async fn the_input_lock_is_held_while_the_dialog_is_open() {
+        let dir = TestDir::new("lockdialog");
+        let policy = dir.policy(Mode::Confirm);
+        let lock_path = policy.config().lock_path.clone();
+        let free_during_dialog = Arc::new(AtomicBool::new(true));
+        let seen = Arc::clone(&free_during_dialog);
+        let mut prompter = FakePrompter::new(None, DialogOutcome::Approved);
+        prompter.during_dialog = Some(Box::new(move || {
+            if !lock_is_free(&lock_path) {
+                seen.store(false, Ordering::SeqCst);
+            }
+        }));
+        policy
+            .begin(click_send(), "c", &prompter)
+            .await
+            .unwrap()
+            .finish(true);
+        assert_eq!(prompter.calls(), (0, 1));
+        assert!(
+            !free_during_dialog.load(Ordering::SeqCst),
+            "the lock was free while the dialog was open"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_input_lock_is_held_while_an_elicitation_is_open() {
+        let dir = TestDir::new("lockelicit");
+        let policy = dir.policy(Mode::Confirm);
+        let lock_path = policy.config().lock_path.clone();
+        let free = Arc::new(AtomicBool::new(true));
+        let seen = Arc::clone(&free);
+        let mut prompter = FakePrompter::new(Some(ElicitOutcome::Approved), DialogOutcome::Denied);
+        prompter.during_dialog = Some(Box::new(move || {
+            if !lock_is_free(&lock_path) {
+                seen.store(false, Ordering::SeqCst);
+            }
+        }));
+        policy
+            .begin(click_send(), "c", &prompter)
+            .await
+            .unwrap()
+            .finish(true);
+        assert!(!free.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn another_server_cannot_send_input_while_a_dialog_is_open() {
+        let dir = TestDir::new("lockother");
+        let policy = dir.policy(Mode::Confirm);
+        // A second server process has its own policy value and the same lock file.
+        let other = Policy::new(policy.config().clone());
+        let outcome = Arc::new(Mutex::new(None::<String>));
+        let slot = Arc::clone(&outcome);
+        let mut prompter = FakePrompter::new(None, DialogOutcome::Approved);
+        prompter.during_dialog = Some(Box::new(move || {
+            let other = other.clone();
+            let slot = Arc::clone(&slot);
+            // The hook is not async, so it runs the second call on a thread.
+            std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_time()
+                    .build()
+                    .unwrap();
+                let result =
+                    runtime.block_on(other.begin(facts("scroll"), "other", &FakePrompter::none()));
+                *slot.lock().unwrap() = Some(match result {
+                    Ok(permit) => {
+                        permit.finish(true);
+                        "allowed".to_string()
+                    }
+                    Err(refusal) => refusal.message,
+                });
+            })
+            .join()
+            .unwrap();
+        }));
+        policy
+            .begin(click_send(), "c", &prompter)
+            .await
+            .unwrap()
+            .finish(true);
+        let message = outcome.lock().unwrap().clone().unwrap();
+        assert!(message.contains("input lock"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn the_lock_is_taken_before_the_caller_reads_facts() {
+        let dir = TestDir::new("lockfirst");
+        let policy = dir.policy(Mode::Confirm);
+        let base = ActionFacts::new("click");
+        let entry = policy.enter(&base, "c").await.unwrap();
+        // The caller reads window and element facts here, with the lock held.
+        assert!(!lock_is_free(&policy.config().lock_path));
+        let refusal = policy
+            .begin(facts("scroll"), "b", &FakePrompter::none())
+            .await
+            .unwrap_err();
+        assert!(
+            refusal.message.contains("input lock"),
+            "{}",
+            refusal.message
+        );
+        let permit = entry
+            .decide(facts("click"), &FakePrompter::none())
+            .await
+            .unwrap();
+        permit.finish(true);
+        assert!(lock_is_free(&policy.config().lock_path));
+    }
+
+    #[tokio::test]
+    async fn the_lock_stays_until_the_end_line_is_written() {
+        let dir = TestDir::new("lockend");
+        let policy = dir.policy(Mode::Full);
+        let permit = policy
+            .begin(facts("scroll"), "c", &FakePrompter::none())
+            .await
+            .unwrap();
+        assert!(!lock_is_free(&policy.config().lock_path));
+        permit.finish(true);
+        assert!(lock_is_free(&policy.config().lock_path));
+    }
+
+    #[tokio::test]
+    async fn a_refusal_releases_the_lock() {
+        let dir = TestDir::new("lockrelease");
+        let policy = dir.policy(Mode::Confirm);
+        let prompter = FakePrompter::new(None, DialogOutcome::Denied);
+        policy
+            .begin(click_send(), "c", &prompter)
+            .await
+            .unwrap_err();
+        assert!(lock_is_free(&policy.config().lock_path));
+    }
+
+    #[tokio::test]
+    async fn the_start_line_is_written_before_the_action_and_the_end_line_after() {
+        let dir = TestDir::new("phases");
+        let policy = dir.policy(Mode::Confirm);
+        let prompter = FakePrompter::new(None, DialogOutcome::Approved);
+        let permit = policy.begin(click_send(), "c", &prompter).await.unwrap();
+        // The action runs here. The start line is on disk already.
+        let before = audit_lines(&policy);
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0]["phase"], "start");
+        assert_eq!(before[0]["decision"], "confirmed");
+        assert_eq!(before[0]["tier"], "high");
+        assert!(before[0].get("ok").is_none(), "{}", before[0]);
+        permit.finish(true);
+        let after = audit_lines(&policy);
+        assert_eq!(after.len(), 2);
+        assert_eq!(after[1]["phase"], "end");
+        assert_eq!(after[1]["ok"], true);
+        assert_eq!(after[1]["decision"], "confirmed");
+        assert_eq!(after[0]["call_id"], after[1]["call_id"]);
+        assert!(!after[0]["call_id"].as_str().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn each_call_has_its_own_call_id() {
+        let dir = TestDir::new("callid");
+        let policy = dir.policy(Mode::Full);
+        for _ in 0..3 {
+            policy
+                .begin(facts("scroll"), "c", &FakePrompter::none())
+                .await
+                .unwrap()
+                .finish(true);
+        }
+        let ids: std::collections::BTreeSet<String> = audit_lines(&policy)
+            .iter()
+            .map(|line| line["call_id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(ids.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_failed_action_writes_ok_false_on_the_end_line() {
+        let dir = TestDir::new("endfalse");
+        let policy = dir.policy(Mode::Full);
+        policy
+            .begin(facts("scroll"), "c", &FakePrompter::none())
+            .await
+            .unwrap()
+            .finish(false);
+        let lines = audit_lines(&policy);
+        assert_eq!(lines[1]["phase"], "end");
+        assert_eq!(lines[1]["ok"], false);
+    }
+
+    #[tokio::test]
+    async fn every_refusal_writes_exactly_one_refused_line() {
+        let dir = TestDir::new("refusedone");
+        let cases: Vec<(&str, Mode, ActionFacts, FakePrompter)> = vec![
+            (
+                "observe",
+                Mode::Observe,
+                facts("click"),
+                FakePrompter::none(),
+            ),
+            (
+                "blocked",
+                Mode::Confirm,
+                in_window("type_text", "firefox", "Login")
+                    .with_element(Some("password text"), None, None)
+                    .with_text("pw"),
+                FakePrompter::none(),
+            ),
+            (
+                "denied",
+                Mode::Confirm,
+                click_send(),
+                FakePrompter::new(None, DialogOutcome::Denied),
+            ),
+            (
+                "nochannel",
+                Mode::Confirm,
+                click_send(),
+                FakePrompter::none(),
+            ),
+        ];
+        for (label, mode, facts, prompter) in cases {
+            let policy = dir.policy(mode);
+            let before = audit_lines(&policy).len();
+            policy.begin(facts, "c", &prompter).await.unwrap_err();
+            let lines = audit_lines(&policy);
+            assert_eq!(lines.len(), before + 1, "{label}");
+            let line = lines.last().unwrap();
+            assert_eq!(line["phase"], "refused", "{label}");
+            assert_eq!(line["ok"], false, "{label}");
+            assert!(!line["call_id"].as_str().unwrap().is_empty(), "{label}");
+        }
+        assert!(lock_is_free(&dir.policy(Mode::Full).config().lock_path));
+    }
+
+    #[tokio::test]
+    async fn a_call_that_cannot_get_the_lock_writes_a_refused_line() {
+        let dir = TestDir::new("locktimeout");
+        let policy = dir.policy(Mode::Full);
+        let holder = policy
+            .begin(facts("scroll"), "a", &FakePrompter::none())
+            .await
+            .unwrap();
+        let refusal = policy
+            .begin(facts("scroll"), "b", &FakePrompter::none())
+            .await
+            .unwrap_err();
+        assert!(
+            refusal.message.contains("input lock"),
+            "{}",
+            refusal.message
+        );
+        holder.finish(true);
+        let phases: Vec<String> = decisions_by_phase(&policy);
+        assert_eq!(phases, ["start:allowed", "refused:refused", "end:allowed"]);
+    }
+
+    #[tokio::test]
+    async fn a_dropped_entry_writes_a_refused_line_and_releases_the_lock() {
+        let dir = TestDir::new("cancelled");
+        let policy = dir.policy(Mode::Confirm);
+        let entry = policy.enter(&ActionFacts::new("click"), "c").await.unwrap();
+        drop(entry);
+        assert_eq!(decisions_by_phase(&policy), ["refused:cancelled"]);
+        assert!(lock_is_free(&policy.config().lock_path));
+    }
+
+    #[tokio::test]
+    async fn the_gate_does_not_send_input_when_the_audit_file_cannot_open() {
+        let dir = TestDir::new("auditopen");
+        let policy = dir.policy(Mode::Full);
+        // A directory in place of the log makes every open fail.
+        std::fs::create_dir_all(policy.config().audit_path()).unwrap();
+        let refusal = policy
+            .begin(facts("scroll"), "c", &FakePrompter::none())
+            .await
+            .unwrap_err();
+        assert!(
+            refusal.message.contains("audit log cannot be written"),
+            "{}",
+            refusal.message
+        );
+        assert!(
+            refusal.message.contains("No input was sent"),
+            "{}",
+            refusal.message
+        );
+        assert!(lock_is_free(&policy.config().lock_path));
+    }
+
+    #[tokio::test]
+    async fn the_gate_does_not_send_input_when_the_start_line_cannot_be_written() {
+        let dir = TestDir::new("auditfull");
+        if !Path::new("/dev/full").exists() {
+            return;
+        }
+        let policy = dir.policy(Mode::Full);
+        std::fs::create_dir_all(&policy.config().state_dir).unwrap();
+        // Every write to /dev/full fails with "no space left".
+        std::os::unix::fs::symlink("/dev/full", policy.config().audit_path()).unwrap();
+        let prompter = FakePrompter::none();
+        let refusal = policy
+            .begin(facts("scroll"), "c", &prompter)
+            .await
+            .unwrap_err();
+        assert!(
+            refusal.message.contains("audit log cannot be written"),
+            "{}",
+            refusal.message
+        );
+        assert!(
+            refusal.message.contains("No input was sent"),
+            "{}",
+            refusal.message
+        );
+        assert!(lock_is_free(&policy.config().lock_path));
+    }
+
+    #[tokio::test]
+    async fn a_confirmed_call_with_a_broken_log_never_runs() {
+        let dir = TestDir::new("auditconfirm");
+        if !Path::new("/dev/full").exists() {
+            return;
+        }
+        let policy = dir.policy(Mode::Confirm);
+        std::fs::create_dir_all(&policy.config().state_dir).unwrap();
+        std::os::unix::fs::symlink("/dev/full", policy.config().audit_path()).unwrap();
+        let prompter = FakePrompter::new(None, DialogOutcome::Approved);
+        let result = policy.begin(click_send(), "c", &prompter).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn long_shell_commands_are_refused_in_confirm_mode_and_allowed_in_full_mode() {
+        let dir = TestDir::new("longshell");
+        let long = "x".repeat(RUN_SHELL_PREVIEW_MAX_CHARS + 1);
+        let confirm = dir.policy(Mode::Confirm);
+        let prompter = FakePrompter::new(Some(ElicitOutcome::Approved), DialogOutcome::Approved);
+        let refusal = confirm
+            .begin(
+                ActionFacts::new("run_shell").with_command(&long),
+                "c",
+                &prompter,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            refusal.message.contains("TAKE_MY_COMPUTER_POLICY=full"),
+            "{}",
+            refusal.message
+        );
+        assert!(refusal.message.contains("2000"), "{}", refusal.message);
+        assert_eq!(prompter.calls(), (0, 0));
+        let lines = audit_lines(&confirm);
+        assert_eq!(lines[0]["reason"], "command_too_long");
+        let raw = std::fs::read_to_string(confirm.config().audit_path()).unwrap();
+        assert!(!raw.contains(&long), "the audit log holds the command");
+
+        let full = dir.policy(Mode::Full);
+        full.begin(
+            ActionFacts::new("run_shell").with_command(&long),
+            "c",
+            &FakePrompter::none(),
+        )
+        .await
+        .unwrap()
+        .finish(true);
+    }
+
+    #[tokio::test]
+    async fn a_short_shell_command_shows_in_full_in_the_confirmation_message() {
+        let dir = TestDir::new("shellprompt");
+        let policy = dir.policy(Mode::Confirm);
+        let command = format!("echo start && {} && echo end", "true && ".repeat(100));
+        let prompter = FakePrompter::new(Some(ElicitOutcome::Approved), DialogOutcome::Denied);
+        policy
+            .begin(
+                ActionFacts::new("run_shell").with_command(&command),
+                "c",
+                &prompter,
+            )
+            .await
+            .unwrap()
+            .finish(true);
+        let shown = prompter.last_text.lock().unwrap().clone();
+        assert!(shown.contains(&command), "{shown}");
+        let raw = std::fs::read_to_string(policy.config().audit_path()).unwrap();
+        assert!(
+            !raw.contains("echo start"),
+            "the audit log holds the command"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_kill_switch_after_the_lock_wait_still_blocks_the_action() {
+        let dir = TestDir::new("killafterlock");
+        let policy = dir.policy(Mode::Full);
+        let entry = policy
+            .enter(&ActionFacts::new("scroll"), "c")
+            .await
+            .unwrap();
+        // The operator presses the kill switch while the caller reads facts.
+        engage_kill_switch(policy.config()).unwrap();
+        let refusal = entry
+            .decide(facts("scroll"), &FakePrompter::none())
+            .await
+            .unwrap_err();
+        assert!(
+            refusal.message.contains("kill switch"),
+            "{}",
+            refusal.message
+        );
+        assert_eq!(decisions_by_phase(&policy), ["refused:refused"]);
+    }
+
     #[test]
     fn status_reports_mode_switch_apps_and_paths() {
         let dir = TestDir::new("status");
@@ -2221,6 +3485,7 @@ mod tests {
         );
         assert!(status.audit_log.ends_with("audit.jsonl"));
         assert_eq!(status.send_on_enter_apps.len(), 10);
+        assert_eq!(status.terminal_apps.len(), 14);
         assert_eq!(status.confirmation_channels.first().unwrap(), "elicitation");
         assert_eq!(status.warning.as_deref(), Some("careful"));
         let json = serde_json::to_value(&status).unwrap();

@@ -13,8 +13,8 @@ use crate::monitors::{
     MonitorSelector,
 };
 use crate::policy::{
-    client_supports_elicitation, ActionFacts, Mode, Permit, Policy, PolicyStatus, Refusal,
-    SystemPrompter,
+    client_supports_elicitation, key_needs_focus_check, ActionFacts, Entry as GateEntry, Mode,
+    Permit, Policy, PolicyStatus, Refusal, SystemPrompter,
 };
 use crate::remote_desktop::{
     click as portal_click, drag as portal_drag, keysyms_for_text, press_key_chord,
@@ -89,6 +89,9 @@ const SHELL_RESPONSE_STREAM_BYTES: usize = 512 * 1024;
 struct CachedAccessibilitySnapshot {
     nodes: Vec<AccessibilityNode>,
     pid: Option<u32>,
+    /// Grows by one each time the cache is replaced. The safety gate reads it
+    /// with the facts it rates. The action refuses to run if it changed.
+    generation: u64,
 }
 
 #[derive(Clone, Default)]
@@ -213,7 +216,7 @@ impl ComputerUseLinux {
 
     #[tool(
         name = "policy_status",
-        description = "Report the safety policy: mode (confirm, full, or observe), kill switch state, the send-on-Enter app list, the confirmation channels, and the audit log path.",
+        description = "Report the safety policy: mode (confirm, full, or observe), kill switch state, the send-on-Enter app list, the terminal app list, the confirmation channels, and the audit log path.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -387,9 +390,8 @@ impl ComputerUseLinux {
     ) -> Result<CallToolResult, ErrorData> {
         let capture = params.capture.clone();
         let target = params.clone().into_target();
-        let window = self.gate_window(Some(&target), false).await;
         let permit = match self
-            .gate(Self::facts_with_window("activate_window", window.as_ref()))
+            .gate_with_window(ActionFacts::new("activate_window"), Some(&target))
             .await
         {
             Ok(permit) => permit,
@@ -702,9 +704,8 @@ impl ComputerUseLinux {
         // only reads pixels.
         let permit = match params.window_target() {
             Some(target) if params.raise_window.unwrap_or(true) => {
-                let window = self.gate_window(Some(&target), false).await;
                 match self
-                    .gate(Self::facts_with_window("screenshot", window.as_ref()))
+                    .gate_with_window(ActionFacts::new("screenshot"), Some(&target))
                     .await
                 {
                     Ok(permit) => Some(permit),
@@ -894,19 +895,31 @@ impl ComputerUseLinux {
         let capture = params.capture.clone();
         let target = params.window_target();
         let by_element = params.x.zip(params.y).is_none();
-        let window = self.gate_window(target.as_ref(), by_element).await;
-        let mut facts = Self::facts_with_window("click", window.as_ref());
-        if by_element {
-            let element = self.gate_element(
-                params.element_index,
-                None,
-                &params.selector(),
-                ElementResolvePurpose::Click,
-            );
-            facts = Self::facts_with_element(facts, &element);
+        let gated = async {
+            let base = ActionFacts::new("click");
+            let entry = self.gate_enter(&base).await?;
+            let generation = self.gate_generation();
+            let window = self.gate_window(target.as_ref(), by_element).await;
+            let mut facts = Self::facts_with_window(base, window.as_ref());
+            if by_element {
+                let element = self.gate_element(
+                    params.element_index,
+                    None,
+                    &params.selector(),
+                    ElementResolvePurpose::Click,
+                );
+                facts = Self::facts_with_element(facts, &element);
+            } else {
+                facts = self
+                    .facts_with_click_point(facts, &params, window.as_ref())
+                    .await;
+            }
+            let permit = self.gate_decide(entry, facts).await?;
+            Ok::<_, Refusal>((permit, generation))
         }
-        let permit = match self.gate(facts).await {
-            Ok(permit) => permit,
+        .await;
+        let (permit, generation) = match gated {
+            Ok(gated) => gated,
             Err(refusal) => {
                 return self
                     .finish_action_output(
@@ -917,7 +930,7 @@ impl ComputerUseLinux {
                     .await;
             }
         };
-        let Json(output) = self.dispatch_click(params).await;
+        let Json(output) = self.dispatch_click(params, generation).await;
         let ok = output.ok;
         let result = self
             .finish_action_output(output, &capture, target.as_ref())
@@ -926,9 +939,16 @@ impl ComputerUseLinux {
         result
     }
 
-    async fn dispatch_click(&self, mut params: ClickParams) -> Json<ActionOutput> {
+    async fn dispatch_click(
+        &self,
+        mut params: ClickParams,
+        expected_generation: Option<u64>,
+    ) -> Json<ActionOutput> {
         let received = Some(serde_json::json!(params.clone()));
         let input_guard = Arc::clone(&self.input_operation_lock).lock_owned().await;
+        if let Err(message) = self.check_snapshot_generation(expected_generation) {
+            return Json(input_failure("click", message, received));
+        }
         let mut portal_target_point = None;
         let mut target_pid = params.pid;
         // Raise the target window first (if specified) so the click lands on the
@@ -1291,19 +1311,25 @@ impl ComputerUseLinux {
     ) -> Result<CallToolResult, ErrorData> {
         let capture = params.capture.clone();
         let requested_action = requested_or_primary_action(params.action.as_deref());
-        let window = self.gate_window(None, true).await;
-        let element = self.gate_element(
-            params.element_index,
-            params.element_identifier.as_deref(),
-            &params.selector(),
-            ElementResolvePurpose::Action,
-        );
-        let facts = Self::facts_with_element(
-            Self::facts_with_window("perform_action", window.as_ref()),
-            &element,
-        );
-        let permit = match self.gate(facts).await {
-            Ok(permit) => permit,
+        let gated = async {
+            let base = ActionFacts::new("perform_action");
+            let entry = self.gate_enter(&base).await?;
+            let generation = self.gate_generation();
+            let window = self.gate_window(None, true).await;
+            let element = self.gate_element(
+                params.element_index,
+                params.element_identifier.as_deref(),
+                &params.selector(),
+                ElementResolvePurpose::Action,
+            );
+            let facts =
+                Self::facts_with_element(Self::facts_with_window(base, window.as_ref()), &element);
+            let permit = self.gate_decide(entry, facts).await?;
+            Ok::<_, Refusal>((permit, generation))
+        }
+        .await;
+        let (permit, generation) = match gated {
+            Ok(gated) => gated,
             Err(refusal) => {
                 return self
                     .finish_action_output(
@@ -1315,7 +1341,7 @@ impl ComputerUseLinux {
             }
         };
         let Json(output) = self
-            .perform_element_action(&params, Some(requested_action))
+            .perform_element_action(&params, Some(requested_action), generation)
             .await;
         let ok = output.ok;
         let result = self.finish_action_output(output, &capture, None).await;
@@ -1339,36 +1365,48 @@ impl ComputerUseLinux {
         Parameters(params): Parameters<SetValueParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let capture = params.capture.clone();
-        let window = self.gate_window(None, true).await;
-        let element = self.gate_element(
-            params.element_index,
-            params.element_identifier.as_deref(),
-            &params.selector(),
-            ElementResolvePurpose::SetValue,
-        );
-        let facts = Self::facts_with_element(
-            Self::facts_with_window("set_value", window.as_ref()),
-            &element,
-        )
-        .with_text(&params.value);
-        let permit = match self.gate(facts).await {
-            Ok(permit) => permit,
+        let gated = async {
+            let base = ActionFacts::new("set_value").with_text(&params.value);
+            let entry = self.gate_enter(&base).await?;
+            let generation = self.gate_generation();
+            let window = self.gate_window(None, true).await;
+            let element = self.gate_element(
+                params.element_index,
+                params.element_identifier.as_deref(),
+                &params.selector(),
+                ElementResolvePurpose::SetValue,
+            );
+            let facts =
+                Self::facts_with_element(Self::facts_with_window(base, window.as_ref()), &element);
+            let permit = self.gate_decide(entry, facts).await?;
+            Ok::<_, Refusal>((permit, generation))
+        }
+        .await;
+        let (permit, generation) = match gated {
+            Ok(gated) => gated,
             Err(refusal) => {
                 return self
                     .finish_action_output(refused_output("set_value", &refusal), &capture, None)
                     .await;
             }
         };
-        let Json(output) = self.dispatch_set_value(params).await;
+        let Json(output) = self.dispatch_set_value(params, generation).await;
         let ok = output.ok;
         let result = self.finish_action_output(output, &capture, None).await;
         permit.finish(ok);
         result
     }
 
-    async fn dispatch_set_value(&self, params: SetValueParams) -> Json<ActionOutput> {
+    async fn dispatch_set_value(
+        &self,
+        params: SetValueParams,
+        expected_generation: Option<u64>,
+    ) -> Json<ActionOutput> {
         let _input_guard = Arc::clone(&self.input_operation_lock).lock_owned().await;
         let received = Some(serde_json::json!(params.clone()));
+        if let Err(message) = self.check_snapshot_generation(expected_generation) {
+            return Json(input_failure("set_value", message, received));
+        }
         let object_ref = match self.resolve_object_ref(
             params.element_index,
             params.element_identifier.as_deref(),
@@ -1430,9 +1468,8 @@ impl ComputerUseLinux {
     ) -> Result<CallToolResult, ErrorData> {
         let capture = params.capture.clone();
         let target = params.window_target();
-        let window = self.gate_window(target.as_ref(), false).await;
         let permit = match self
-            .gate(Self::facts_with_window("scroll", window.as_ref()))
+            .gate_with_window(ActionFacts::new("scroll"), target.as_ref())
             .await
         {
             Ok(permit) => permit,
@@ -1831,11 +1868,7 @@ impl ComputerUseLinux {
         Parameters(params): Parameters<DragParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let capture = params.capture.clone();
-        let window = self.gate_window(None, false).await;
-        let permit = match self
-            .gate(Self::facts_with_window("drag", window.as_ref()))
-            .await
-        {
+        let permit = match self.gate_with_window(ActionFacts::new("drag"), None).await {
             Ok(permit) => permit,
             Err(refusal) => {
                 return self
@@ -1996,9 +2029,20 @@ impl ComputerUseLinux {
     ) -> Result<CallToolResult, ErrorData> {
         let capture = params.capture.clone();
         let target = params.window_target();
-        let window = self.gate_window(Some(&target), false).await;
-        let facts = Self::facts_with_window("press_key", window.as_ref()).with_key(&params.key);
-        let permit = match self.gate(facts).await {
+        let gated = async {
+            let base = ActionFacts::new("press_key").with_key(&params.key);
+            let entry = self.gate_enter(&base).await?;
+            let window = self.gate_window(Some(&target), false).await;
+            let mut facts = Self::facts_with_window(base, window.as_ref());
+            // Enter and space press a focused control, and a single character
+            // types into a password field, so these keys need the focus.
+            if key_needs_focus_check(&params.key) {
+                facts = self.facts_with_focus(facts, window.as_ref(), &target).await;
+            }
+            self.gate_decide(entry, facts).await
+        }
+        .await;
+        let permit = match gated {
             Ok(permit) => permit,
             Err(refusal) => {
                 return self
@@ -2197,17 +2241,18 @@ impl ComputerUseLinux {
     ) -> Result<CallToolResult, ErrorData> {
         let capture = params.capture.clone();
         let target = params.window_target();
-        let window = self.gate_window(Some(&target), false).await;
-        let mut facts =
-            Self::facts_with_window("type_text", window.as_ref()).with_text(&params.text);
-        if self.policy.mode() == Mode::Confirm {
-            // Only the confirm mode refuses password fields, so only it pays
-            // for the focus probe.
-            if let Some(element) = self.gate_focused_element(window.as_ref()).await {
-                facts = facts.with_element(Some(&element.role), element.name.as_deref(), None);
-            }
+        let gated = async {
+            let base = ActionFacts::new("type_text").with_text(&params.text);
+            let entry = self.gate_enter(&base).await?;
+            let window = self.gate_window(Some(&target), false).await;
+            let facts = Self::facts_with_window(base, window.as_ref());
+            // The focused element shows a password field, and a control that a
+            // line break would press.
+            let facts = self.facts_with_focus(facts, window.as_ref(), &target).await;
+            self.gate_decide(entry, facts).await
         }
-        let permit = match self.gate(facts).await {
+        .await;
+        let permit = match gated {
             Ok(permit) => permit,
             Err(refusal) => {
                 return self
@@ -2481,9 +2526,8 @@ impl ComputerUseLinux {
         let capture = params.target.capture.clone();
         let received = Some(serde_json::json!(params.clone()));
         let target = params.target.into_target();
-        let window = self.gate_window(Some(&target), false).await;
         let permit = match self
-            .gate(Self::facts_with_window("move_window", window.as_ref()))
+            .gate_with_window(ActionFacts::new("move_window"), Some(&target))
             .await
         {
             Ok(permit) => permit,
@@ -2529,9 +2573,8 @@ impl ComputerUseLinux {
         let capture = params.target.capture.clone();
         let received = Some(serde_json::json!(params.clone()));
         let target = params.target.into_target();
-        let window = self.gate_window(Some(&target), false).await;
         let permit = match self
-            .gate(Self::facts_with_window("resize_window", window.as_ref()))
+            .gate_with_window(ActionFacts::new("resize_window"), Some(&target))
             .await
         {
             Ok(permit) => permit,
@@ -2568,7 +2611,7 @@ impl ComputerUseLinux {
     // can't be env!("CARGO_PKG_VERSION"); the MCP safety check (CI) fails the
     // build if it drifts from the Cargo version.
     version = "0.7.20-tmc.1",
-    instructions = "Begin every turn that uses Computer Use by calling get_app_state. If diagnostics report disabled GNOME accessibility, call setup_accessibility before asking the user to retry. Use list_windows/focused_window before targeted keyboard input. If diagnostics report windowing.can_list_windows=false on GNOME, call setup_window_targeting to install the optional GNOME Shell extension backend, then ask the user to log out and back in if the setup report says a shell reload is required. This Linux backend can capture size-bounded screenshots through GNOME Shell or XDG Desktop Portal, read AT-SPI trees with action/value metadata, invoke native AT-SPI actions, set AT-SPI values or editable text, list/focus compositor windows through registered Linux window backends when the session permits it, attach best-effort terminal tty/process metadata to terminal windows, send coordinate or element-targeted click/scroll/drag input through the Wayland remote desktop portal when available, and send literal type_text through KDE clipboard integration on Plasma Wayland, wtype on compatible Wayland compositors, or portal keysyms on other Wayland sessions. Portal text startup or conversion failures return an error without replaying through ydotool. GNOME preflights the complete text against every configured keyboard layout group because the background reader cannot establish the active group; rejected text can use set_value on an editable field. Raw ydotool text is limited to printable ASCII, tab and newline, uses US physical key positions, and requires checking the resulting field contents under the active layout. Screenshot results include width/height for the returned image plus coordinate_width/coordinate_height and scale for desktop coordinate conversion; request more detail with max_width, max_height, max_bytes, format=jpeg, quality, or a smaller target/crop instead of relying on unbounded screenshots. Mutating tools (click, type_text, press_key, scroll, drag, perform_action, set_value, activate_window, move_window, resize_window) accept optional screenshot_after (true, \"screen\", or \"window\") with format/quality/scale/max_width/max_height/max_bytes and optional include_tree=true to return post-action observation in the same tool call. Tools with readOnlyHint=false may mutate local desktop or application state; hosts should require approval for actions that can submit, delete, send, purchase, or overwrite data. For element-targeted actions, prefer element_index from the latest get_app_state result; click, perform_action, and set_value can also use semantic role/name/text/states selectors when the target is unique. type_text and press_key accept optional window_id, pid, app_id, wm_class, title, tty, terminal_pid, terminal_command, or terminal_cwd selectors and refuse targeted input if focus cannot be verified. After targeted keyboard input, results append focused-element feedback from AT-SPI (role, name, editable) and warn when a concrete non-terminal focus is not editable. Exact window focus alone does not suppress a missing-focus warning; only a complete scoped tree containing window/menu chrome without content makes it informational. Terminals accept keyboard input without an EditableText interface. On Hyprland, wtype uses a single literal argument after -- to avoid stdin keymap-refresh corruption; text is visible in process arguments, so confirmed password fields are rejected (use set_value). Terminals and ambiguous fields, with or without AT-SPI, use private stdin for at most 100 Unicode characters per call; split larger input into smaller calls or expose accessibility. Input classification has its own 1500 ms budget, independent of the 250 ms cosmetic indicator timeout. Other compatible compositors retain stdin. The wtype path rejects NUL and more than 131071 UTF-8 bytes before focus or indicators. X11 xdotool can silently substitute symbols under non-US XKB layouts (reported with br/ABNT2) or changing keymap state; inspect the text before pressing Enter or submitting it. A successful type_text result confirms dispatch only; every text backend leaves field contents unverified. Re-observe the target before retrying. Screenshot, click, and input results warn when the target window or coordinate is partially or fully off-screen; use move_window/resize_window (GNOME Shell extension backend) to bring a window fully on-screen before retrying. scroll accepts the same window targeting and relative coordinates as click. get_app_state returns a compact readiness block by default; pass verbose=true for the full diagnostics dump. Scope get_app_state with app_name_or_bundle_identifier or a window target (window_id, pid, app_id, wm_class, title); without one it returns the whole desktop AT-SPI tree, reports tree_scoped=false, and warns in message, which can flood context. accessibility_tree_truncated=true means the node, depth, or read budget stopped traversal with unread elements left; recover by scoping to a narrower app or window target and raising max_nodes or max_depth (hard caps 2000 and 64), not by lowering max_nodes. Electron apps with only window/menu chrome may need --force-renderer-accessibility to expose renderer content. Call list_monitors to see each monitor (index, connector, position, size, primary). To capture one monitor at native size, pass monitor (an index, a connector name, or \"primary\") to screenshot or get_app_state. Monitor screenshots add monitor, origin_x, and origin_y to the metadata: desktop x = origin_x + preview x / scale. Pass monitor to click, drag, or scroll to measure x and y from the top-left corner of that monitor. The server rejects a point outside the monitor. Do not combine monitor with a window target or with relative: true. Mutating tools pass a safety gate in the server. Call policy_status to read the mode (confirm, full, or observe), the kill switch state, and the send-on-Enter app list. In confirm mode, high-impact calls need user confirmation: click or perform_action on a control named like send, submit, delete, pay, kirim, hapus, or bayar; Enter in a messaging app; setup_accessibility, setup_window_targeting, and run_shell. A refused call returns ok=false with a reason. Do not retry it and do not try to bypass the gate. Tell the user which mode or confirmation allows it. Typing into a password field is refused in confirm mode. The operator can stop all input with the kill switch (computer-use-linux stop). screenshot with a window target raises that window, so observe mode refuses it. Use raise_window=false to capture without changing focus."
+    instructions = "Begin every turn that uses Computer Use by calling get_app_state. If diagnostics report disabled GNOME accessibility, call setup_accessibility before asking the user to retry. Use list_windows/focused_window before targeted keyboard input. If diagnostics report windowing.can_list_windows=false on GNOME, call setup_window_targeting to install the optional GNOME Shell extension backend, then ask the user to log out and back in if the setup report says a shell reload is required. This Linux backend can capture size-bounded screenshots through GNOME Shell or XDG Desktop Portal, read AT-SPI trees with action/value metadata, invoke native AT-SPI actions, set AT-SPI values or editable text, list/focus compositor windows through registered Linux window backends when the session permits it, attach best-effort terminal tty/process metadata to terminal windows, send coordinate or element-targeted click/scroll/drag input through the Wayland remote desktop portal when available, and send literal type_text through KDE clipboard integration on Plasma Wayland, wtype on compatible Wayland compositors, or portal keysyms on other Wayland sessions. Portal text startup or conversion failures return an error without replaying through ydotool. GNOME preflights the complete text against every configured keyboard layout group because the background reader cannot establish the active group; rejected text can use set_value on an editable field. Raw ydotool text is limited to printable ASCII, tab and newline, uses US physical key positions, and requires checking the resulting field contents under the active layout. Screenshot results include width/height for the returned image plus coordinate_width/coordinate_height and scale for desktop coordinate conversion; request more detail with max_width, max_height, max_bytes, format=jpeg, quality, or a smaller target/crop instead of relying on unbounded screenshots. Mutating tools (click, type_text, press_key, scroll, drag, perform_action, set_value, activate_window, move_window, resize_window) accept optional screenshot_after (true, \"screen\", or \"window\") with format/quality/scale/max_width/max_height/max_bytes and optional include_tree=true to return post-action observation in the same tool call. Tools with readOnlyHint=false may mutate local desktop or application state; hosts should require approval for actions that can submit, delete, send, purchase, or overwrite data. For element-targeted actions, prefer element_index from the latest get_app_state result; click, perform_action, and set_value can also use semantic role/name/text/states selectors when the target is unique. type_text and press_key accept optional window_id, pid, app_id, wm_class, title, tty, terminal_pid, terminal_command, or terminal_cwd selectors and refuse targeted input if focus cannot be verified. After targeted keyboard input, results append focused-element feedback from AT-SPI (role, name, editable) and warn when a concrete non-terminal focus is not editable. Exact window focus alone does not suppress a missing-focus warning; only a complete scoped tree containing window/menu chrome without content makes it informational. Terminals accept keyboard input without an EditableText interface. On Hyprland, wtype uses a single literal argument after -- to avoid stdin keymap-refresh corruption; text is visible in process arguments, so confirmed password fields are rejected (use set_value). Terminals and ambiguous fields, with or without AT-SPI, use private stdin for at most 100 Unicode characters per call; split larger input into smaller calls or expose accessibility. Input classification has its own 1500 ms budget, independent of the 250 ms cosmetic indicator timeout. Other compatible compositors retain stdin. The wtype path rejects NUL and more than 131071 UTF-8 bytes before focus or indicators. X11 xdotool can silently substitute symbols under non-US XKB layouts (reported with br/ABNT2) or changing keymap state; inspect the text before pressing Enter or submitting it. A successful type_text result confirms dispatch only; every text backend leaves field contents unverified. Re-observe the target before retrying. Screenshot, click, and input results warn when the target window or coordinate is partially or fully off-screen; use move_window/resize_window (GNOME Shell extension backend) to bring a window fully on-screen before retrying. scroll accepts the same window targeting and relative coordinates as click. get_app_state returns a compact readiness block by default; pass verbose=true for the full diagnostics dump. Scope get_app_state with app_name_or_bundle_identifier or a window target (window_id, pid, app_id, wm_class, title); without one it returns the whole desktop AT-SPI tree, reports tree_scoped=false, and warns in message, which can flood context. accessibility_tree_truncated=true means the node, depth, or read budget stopped traversal with unread elements left; recover by scoping to a narrower app or window target and raising max_nodes or max_depth (hard caps 2000 and 64), not by lowering max_nodes. Electron apps with only window/menu chrome may need --force-renderer-accessibility to expose renderer content. Call list_monitors to see each monitor (index, connector, position, size, primary). To capture one monitor at native size, pass monitor (an index, a connector name, or \"primary\") to screenshot or get_app_state. Monitor screenshots add monitor, origin_x, and origin_y to the metadata: desktop x = origin_x + preview x / scale. Pass monitor to click, drag, or scroll to measure x and y from the top-left corner of that monitor. The server rejects a point outside the monitor. Do not combine monitor with a window target or with relative: true. Mutating tools pass a safety gate in the server. Call policy_status to read the mode (confirm, full, or observe), the kill switch state, and the send-on-Enter app list. In confirm mode, high-impact calls need user confirmation: click or perform_action on a control named like send, submit, delete, pay, kirim, hapus, or bayar; Enter in a messaging app; setup_accessibility, setup_window_targeting, and run_shell. A refused call returns ok=false with a reason. Do not retry it and do not try to bypass the gate. Tell the user which mode or confirmation allows it. Typing into a password field is refused in confirm mode. Enter in a terminal runs a shell command, so it needs confirmation too. The operator can stop all input with the kill switch (computer-use-linux stop). screenshot with a window target raises that window, so observe mode refuses it. Use raise_window=false to capture without changing focus."
 )]
 impl ServerHandler for ComputerUseLinux {}
 
@@ -3817,6 +3860,35 @@ struct GateElement {
 /// Upper bound for the read-only lookups that feed the gate.
 const GATE_LOOKUP_TIMEOUT: Duration = Duration::from_millis(1500);
 
+const SNAPSHOT_CHANGED_MESSAGE: &str = "The accessibility snapshot changed after the safety check, so the target may be a different control now. No input was sent. Call get_app_state again, then retry.";
+
+/// The smallest element of the snapshot whose bounds hold the desktop point.
+/// A deeper element wins a tie, because it is the more specific control.
+fn smallest_node_at(nodes: &[AccessibilityNode], x: i32, y: i32) -> Option<&AccessibilityNode> {
+    nodes
+        .iter()
+        .filter_map(|node| {
+            let bounds = node.bounds.as_ref()?;
+            if bounds.width <= 0 || bounds.height <= 0 {
+                return None;
+            }
+            // A huge negative origin is a placeholder, not a position.
+            if bounds.x <= i32::MIN / 2 || bounds.y <= i32::MIN / 2 {
+                return None;
+            }
+            let inside = i64::from(x) >= i64::from(bounds.x)
+                && i64::from(x) < i64::from(bounds.x) + i64::from(bounds.width)
+                && i64::from(y) >= i64::from(bounds.y)
+                && i64::from(y) < i64::from(bounds.y) + i64::from(bounds.height);
+            inside.then(|| {
+                let area = i64::from(bounds.width) * i64::from(bounds.height);
+                ((area, std::cmp::Reverse(node.depth), node.index), node)
+            })
+        })
+        .min_by_key(|(key, _)| *key)
+        .map(|(_, node)| node)
+}
+
 fn refused_output(tool: &str, refusal: &Refusal) -> ActionOutput {
     ActionOutput {
         ok: false,
@@ -3859,17 +3931,47 @@ impl ComputerUseLinux {
             .unwrap_or_else(|| "unknown".to_string())
     }
 
-    /// Run the safety gate. Every mutating tool calls this before it changes
-    /// focus, shows an indicator event, or sends input.
-    async fn gate(&self, facts: ActionFacts) -> std::result::Result<Permit, Refusal> {
+    /// First step of the safety gate. It refuses at once for the kill switch
+    /// and the observe mode. Otherwise it takes the input lock and keeps it
+    /// until the action and its audit line are done. The caller reads the
+    /// desktop facts after this call, so no other call can send input while
+    /// the facts are read or while a confirmation is open.
+    async fn gate_enter(&self, base: &ActionFacts) -> std::result::Result<GateEntry, Refusal> {
+        self.policy.enter(base, &self.client_name()).await
+    }
+
+    /// Last step of the safety gate: rate the call, ask the user when needed,
+    /// and write the audit start line. Every mutating tool passes it before it
+    /// changes focus, shows an indicator event, or sends input.
+    async fn gate_decide(
+        &self,
+        entry: GateEntry,
+        facts: ActionFacts,
+    ) -> std::result::Result<Permit, Refusal> {
         let prompter = SystemPrompter::new(self.peer.get().cloned());
-        self.policy
-            .begin(facts, &self.client_name(), &prompter)
+        entry.decide(facts, &prompter).await
+    }
+
+    /// Gate a call that needs no desktop facts.
+    async fn gate(&self, facts: ActionFacts) -> std::result::Result<Permit, Refusal> {
+        let entry = self.gate_enter(&facts).await?;
+        self.gate_decide(entry, facts).await
+    }
+
+    /// Gate a call whose only desktop fact is the target window.
+    async fn gate_with_window(
+        &self,
+        base: ActionFacts,
+        target: Option<&WindowTarget>,
+    ) -> std::result::Result<Permit, Refusal> {
+        let entry = self.gate_enter(&base).await?;
+        let window = self.gate_window(target, false).await;
+        self.gate_decide(entry, Self::facts_with_window(base, window.as_ref()))
             .await
     }
 
-    fn facts_with_window(tool: &'static str, window: Option<&WindowInfo>) -> ActionFacts {
-        ActionFacts::new(tool).with_window(
+    fn facts_with_window(facts: ActionFacts, window: Option<&WindowInfo>) -> ActionFacts {
+        facts.with_window(
             window.and_then(|window| window.app_id.as_deref()),
             window.and_then(|window| window.wm_class.as_deref()),
             window.and_then(|window| window.title.as_deref()),
@@ -3888,6 +3990,32 @@ impl ComputerUseLinux {
         facts.with_unresolved_element(element.unresolved)
     }
 
+    /// Generation of the cached snapshot, for a call that the gate rates from
+    /// the snapshot. Only the confirm mode rates calls, so only it checks.
+    fn gate_generation(&self) -> Option<u64> {
+        (self.policy.mode() == Mode::Confirm).then(|| self.snapshot_generation())
+    }
+
+    fn snapshot_generation(&self) -> u64 {
+        self.last_snapshot
+            .lock()
+            .map(|cached| cached.generation)
+            .unwrap_or(0)
+    }
+
+    /// Refuse an action when the snapshot changed after the gate rated it.
+    /// The action calls this while it holds the input operation lock, which
+    /// also guards every snapshot update, so the snapshot cannot change after
+    /// this check.
+    fn check_snapshot_generation(&self, expected: Option<u64>) -> std::result::Result<(), String> {
+        match expected {
+            Some(expected) if self.snapshot_generation() != expected => {
+                Err(SNAPSHOT_CHANGED_MESSAGE.to_string())
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// The window the gate shows and audits. It is the named target, else the
     /// window of the cached snapshot for element calls, else the focused
     /// window. Read-only, bounded, and best effort: `None` means unknown.
@@ -3896,11 +4024,6 @@ impl ComputerUseLinux {
         target: Option<&WindowTarget>,
         by_element: bool,
     ) -> Option<WindowInfo> {
-        // A refused call needs no lookup. This also keeps the observe mode
-        // and the kill switch from touching the desktop at all.
-        if self.policy.mode() == Mode::Observe || self.policy.config().kill_switch_active() {
-            return None;
-        }
         let snapshot_pid = by_element
             .then(|| self.last_snapshot.lock().ok().and_then(|cached| cached.pid))
             .flatten();
@@ -3962,18 +4085,93 @@ impl ComputerUseLinux {
         }
     }
 
-    /// The focused element in the window's app, for the password check.
+    /// The smallest element of the cached snapshot that holds the desktop
+    /// point. It reads the cache only. It never asks AT-SPI.
+    fn gate_node_at(&self, x: i32, y: i32) -> Option<AccessibilityNode> {
+        let cached = self.last_snapshot.lock().ok()?;
+        smallest_node_at(&cached.nodes, x, y).cloned()
+    }
+
+    /// The click point as a desktop point, for the hit test. A point in
+    /// monitor coordinates turns into a desktop point first. A point relative
+    /// to the window needs the window origin. `None` means the point cannot be
+    /// converted here. The click itself then fails or converts as before.
+    async fn gate_click_point(
+        &self,
+        params: &ClickParams,
+        window: Option<&WindowInfo>,
+    ) -> Option<(i32, i32)> {
+        let (x, y) = params.x.zip(params.y)?;
+        if let Some(selector) = params.capture.monitor.as_ref() {
+            return timeout(
+                GATE_LOOKUP_TIMEOUT,
+                self.monitor_point_to_desktop(selector, x, y),
+            )
+            .await
+            .ok()?
+            .ok();
+        }
+        if params.relative == Some(true) {
+            let bounds = window?.bounds.as_ref()?;
+            return Some((bounds.x?.checked_add(x)?, bounds.y?.checked_add(y)?));
+        }
+        Some((x, y))
+    }
+
+    /// Facts for a click at a point. The gate hit-tests the point against the
+    /// last snapshot. A control under the point gives its name and
+    /// description. With no control, the gate marks the point as unresolved.
+    async fn facts_with_click_point(
+        &self,
+        facts: ActionFacts,
+        params: &ClickParams,
+        window: Option<&WindowInfo>,
+    ) -> ActionFacts {
+        let hit = self
+            .gate_click_point(params, window)
+            .await
+            .and_then(|(x, y)| self.gate_node_at(x, y));
+        match hit {
+            Some(node) => facts.with_element(
+                Some(&node.role),
+                node.name.as_deref(),
+                node.description.as_deref(),
+            ),
+            None => facts.with_unresolved_click_point(),
+        }
+    }
+
+    /// The focused element in the window's app, for the password check and
+    /// for the commit-word check of Enter and space. The probe needs the pid
+    /// of the app: the window gives it, else the call names it.
     async fn gate_focused_element(
         &self,
         window: Option<&WindowInfo>,
+        target: Option<&WindowTarget>,
     ) -> Option<FocusedElementSummary> {
-        let pid = window?.pid?;
-        if self.policy.config().kill_switch_active() {
-            return None;
-        }
+        let pid = window
+            .and_then(|window| window.pid)
+            .or_else(|| target.and_then(|target| target.pid))?;
         match timeout(GATE_LOOKUP_TIMEOUT, probe_focused_element(Some(pid))).await {
             Ok(Ok(FocusProbe::Found(element))) => Some(element),
             _ => None,
+        }
+    }
+
+    /// Add the focused element to the facts of a keyboard call. Only the
+    /// confirm mode rates by element, so only it pays for the probe.
+    async fn facts_with_focus(
+        &self,
+        facts: ActionFacts,
+        window: Option<&WindowInfo>,
+        target: &WindowTarget,
+    ) -> ActionFacts {
+        if self.policy.mode() != Mode::Confirm {
+            return facts;
+        }
+        match self.gate_focused_element(window, Some(target)).await {
+            Some(element) => facts.with_element(Some(&element.role), element.name.as_deref(), None),
+            None => facts,
         }
     }
 
@@ -5148,6 +5346,7 @@ impl ComputerUseLinux {
             *cached = CachedAccessibilitySnapshot {
                 nodes: nodes.to_vec(),
                 pid: target_pid,
+                generation: cached.generation.wrapping_add(1),
             };
         }
     }
@@ -5332,9 +5531,13 @@ impl ComputerUseLinux {
         &self,
         params: &ActionParams,
         requested_action: Option<&str>,
+        expected_generation: Option<u64>,
     ) -> Json<ActionOutput> {
         let _input_guard = Arc::clone(&self.input_operation_lock).lock_owned().await;
         let received = Some(serde_json::json!(params.clone()));
+        if let Err(message) = self.check_snapshot_generation(expected_generation) {
+            return Json(input_failure("perform_action", message, received));
+        }
         let object_ref = match self.resolve_object_ref(
             params.element_index,
             params.element_identifier.as_deref(),
@@ -8131,13 +8334,389 @@ printf '%s %s\n' "${0##*/}" "$*" >> "$CUL_POINTER_TEST_LOG"
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
-        assert_eq!(lines.len(), 2, "{audit}");
+        // The approved call writes a start line and an end line. The declined
+        // call writes one refused line.
+        assert_eq!(lines.len(), 3, "{audit}");
+        assert_eq!(lines[0]["phase"], "start");
         assert_eq!(lines[0]["decision"], "confirmed");
         assert_eq!(lines[0]["client"], "elicit-test");
         assert_eq!(lines[0]["reason"], "unresolved_element");
-        assert_eq!(lines[1]["decision"], "denied");
+        assert_eq!(lines[1]["phase"], "end");
         assert_eq!(lines[1]["ok"], false);
+        assert_eq!(lines[0]["call_id"], lines[1]["call_id"]);
+        assert_eq!(lines[2]["phase"], "refused");
+        assert_eq!(lines[2]["decision"], "denied");
+        assert_eq!(lines[2]["ok"], false);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A click at a point is rated from the last snapshot. A "Send" button
+    /// under the point makes the gate ask, and a decline sends no input.
+    #[tokio::test]
+    async fn coordinate_click_on_a_send_button_asks_for_confirmation_over_mcp() {
+        use tokio::io::{AsyncWriteExt, BufReader};
+        let dir = std::env::temp_dir().join(format!("tmc-coord-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut config = crate::policy::PolicyConfig::from_lookup(|_| None);
+        config.mode = Mode::Confirm;
+        config.state_dir = dir.join("state");
+        config.lock_path = dir.join("run").join("input.lock");
+        let policy = Policy::new(config);
+        let server = ComputerUseLinux {
+            policy: policy.clone(),
+            ..ComputerUseLinux::default()
+        };
+        let mut send = node(
+            1,
+            Some(Bounds {
+                x: 10,
+                y: 10,
+                width: 40,
+                height: 20,
+            }),
+        );
+        send.name = Some("Send".to_string());
+        let mut panel = node(
+            2,
+            Some(Bounds {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            }),
+        );
+        panel.role = "panel".to_string();
+        panel.name = Some("Chat".to_string());
+        server.cache_nodes(&[panel, send]);
+        let gate_peer = Arc::clone(&server.peer);
+        let (server_transport, client_transport) = tokio::io::duplex(1 << 20);
+        let handle = tokio::spawn(async move {
+            if let Ok(running) = server.serve(server_transport).await {
+                let _ = gate_peer.set(running.peer().clone());
+                let _ = running.waiting().await;
+            }
+        });
+        let (read, mut write) = tokio::io::split(client_transport);
+        let mut reader = BufReader::new(read);
+        let send_frame = |frame: serde_json::Value| {
+            let mut line = frame.to_string();
+            line.push('\n');
+            line
+        };
+        write
+            .write_all(
+                send_frame(
+                    serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+                    "protocolVersion":"2025-06-18",
+                    "capabilities":{"elicitation":{}},
+                    "clientInfo":{"name":"coord-test","version":"0"}}}),
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(read_frame(&mut reader).await["id"], 1);
+        write
+            .write_all(
+                send_frame(
+                    serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        write
+            .write_all(
+                send_frame(
+                    serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
+                    "name":"click","arguments":{"x":15,"y":15}}}),
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let request = loop {
+            let frame = read_frame(&mut reader).await;
+            if frame["method"] == "elicitation/create" {
+                break frame;
+            }
+        };
+        let message = request["params"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("coord-test wants to run click."),
+            "{message}"
+        );
+        assert!(message.contains("Element: Send"), "{message}");
+        write
+            .write_all(
+                send_frame(
+                    serde_json::json!({"jsonrpc":"2.0","id":request["id"],"result":{
+                    "action":"decline","content":{}}}),
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let response = loop {
+            let frame = read_frame(&mut reader).await;
+            if frame["id"] == 2 && frame.get("method").is_none() {
+                break frame;
+            }
+        };
+        let output = &response["result"]["structuredContent"];
+        assert_eq!(output["ok"], false, "{response}");
+        assert!(
+            output["message"].as_str().unwrap().contains("declined"),
+            "{response}"
+        );
+        drop(write);
+        drop(reader);
+        let _ = tokio::time::timeout(Duration::from_secs(10), handle).await;
+        let audit = std::fs::read_to_string(policy.config().audit_path()).unwrap();
+        let lines: Vec<serde_json::Value> = audit
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 1, "{audit}");
+        assert_eq!(lines[0]["phase"], "refused");
+        assert_eq!(lines[0]["decision"], "denied");
+        assert_eq!(lines[0]["reason"], "commit_word:send");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ----- gate: hit test, snapshot generation -----
+
+    fn bounds(x: i32, y: i32, width: i32, height: i32) -> Option<Bounds> {
+        Some(Bounds {
+            x,
+            y,
+            width,
+            height,
+        })
+    }
+
+    fn named_node(index: u32, name: &str, bounds: Option<Bounds>) -> AccessibilityNode {
+        let mut node = node(index, bounds);
+        node.name = Some(name.to_string());
+        node
+    }
+
+    #[test]
+    fn hit_test_picks_the_smallest_element_under_the_point() {
+        let nodes = [
+            named_node(0, "Window", bounds(0, 0, 800, 600)),
+            named_node(1, "Toolbar", bounds(0, 0, 800, 50)),
+            named_node(2, "Send", bounds(700, 10, 60, 30)),
+        ];
+        let name = |x, y| {
+            smallest_node_at(&nodes, x, y).and_then(|node| node.name.as_deref().map(str::to_string))
+        };
+        assert_eq!(name(710, 20).as_deref(), Some("Send"));
+        assert_eq!(name(100, 20).as_deref(), Some("Toolbar"));
+        assert_eq!(name(100, 400).as_deref(), Some("Window"));
+        assert_eq!(name(900, 400), None);
+        assert_eq!(name(-1, 0), None);
+    }
+
+    #[test]
+    fn hit_test_treats_the_far_edge_as_outside() {
+        let nodes = [named_node(0, "Send", bounds(10, 10, 20, 20))];
+        assert!(smallest_node_at(&nodes, 10, 10).is_some());
+        assert!(smallest_node_at(&nodes, 29, 29).is_some());
+        assert!(smallest_node_at(&nodes, 30, 15).is_none());
+        assert!(smallest_node_at(&nodes, 15, 30).is_none());
+        assert!(smallest_node_at(&nodes, 9, 15).is_none());
+    }
+
+    #[test]
+    fn hit_test_ignores_elements_without_usable_bounds() {
+        let nodes = [
+            named_node(0, "No bounds", None),
+            named_node(1, "Empty", bounds(0, 0, 0, 50)),
+            named_node(2, "Negative", bounds(0, 0, 50, -5)),
+            named_node(
+                3,
+                "Placeholder",
+                bounds(i32::MIN, i32::MIN, i32::MAX, i32::MAX),
+            ),
+        ];
+        assert!(smallest_node_at(&nodes, 5, 5).is_none());
+        assert!(smallest_node_at(&[], 5, 5).is_none());
+    }
+
+    #[test]
+    fn hit_test_prefers_the_deeper_element_when_areas_tie() {
+        let mut outer = named_node(0, "Wrapper", bounds(0, 0, 50, 50));
+        outer.depth = 1;
+        let mut inner = named_node(1, "Send", bounds(0, 0, 50, 50));
+        inner.depth = 3;
+        let nodes = [outer, inner];
+        assert_eq!(
+            smallest_node_at(&nodes, 5, 5).and_then(|node| node.name.as_deref()),
+            Some("Send")
+        );
+    }
+
+    fn click_at(x: i32, y: i32) -> ClickParams {
+        serde_json::from_value(serde_json::json!({ "x": x, "y": y })).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_coordinate_click_takes_the_element_under_the_point_into_its_facts() {
+        let server = ComputerUseLinux::default();
+        server.cache_nodes(&[
+            named_node(0, "Chat", bounds(0, 0, 800, 600)),
+            named_node(1, "Send message", bounds(700, 10, 60, 30)),
+        ]);
+        let facts = server
+            .facts_with_click_point(ActionFacts::new("click"), &click_at(710, 20), None)
+            .await;
+        assert_eq!(facts.element_name.as_deref(), Some("Send message"));
+        assert!(!facts.click_point_unresolved);
+        let lists = crate::policy::AppLists::default();
+        let rating = crate::policy::classify(&facts, &lists);
+        assert_eq!(rating.tier, crate::policy::Tier::High);
+        assert_eq!(rating.reason.unwrap().code(), "commit_word:send");
+    }
+
+    #[tokio::test]
+    async fn a_coordinate_click_with_no_element_is_marked_unresolved() {
+        let server = ComputerUseLinux::default();
+        server.cache_nodes(&[named_node(0, "Chat", bounds(0, 0, 100, 100))]);
+        let facts = server
+            .facts_with_click_point(ActionFacts::new("click"), &click_at(500, 500), None)
+            .await;
+        assert!(facts.click_point_unresolved);
+        assert!(facts.element_name.is_none());
+        // With no snapshot at all the point is unresolved too.
+        server.clear_cached_nodes();
+        let facts = server
+            .facts_with_click_point(ActionFacts::new("click"), &click_at(5, 5), None)
+            .await;
+        assert!(facts.click_point_unresolved);
+    }
+
+    #[tokio::test]
+    async fn a_window_relative_click_point_adds_the_window_origin() {
+        let server = ComputerUseLinux::default();
+        server.cache_nodes(&[named_node(1, "Delete", bounds(110, 120, 40, 20))]);
+        // The window origin is (10, 20), so relative (105, 105) is desktop (115, 125).
+        let window = window_info(1, Some("Files"), Some("org.example.Files"), None, Some(42));
+        let mut params = click_at(105, 105);
+        params.relative = Some(true);
+        let point = server.gate_click_point(&params, Some(&window)).await;
+        assert_eq!(point, Some((115, 125)));
+        let facts = server
+            .facts_with_click_point(ActionFacts::new("click"), &params, Some(&window))
+            .await;
+        assert_eq!(facts.element_name.as_deref(), Some("Delete"));
+        // Without window bounds the point cannot convert, so the facts say unresolved.
+        let mut bare = window.clone();
+        bare.bounds = None;
+        assert_eq!(server.gate_click_point(&params, Some(&bare)).await, None);
+        assert_eq!(server.gate_click_point(&params, None).await, None);
+        let facts = server
+            .facts_with_click_point(ActionFacts::new("click"), &params, None)
+            .await;
+        assert!(facts.click_point_unresolved);
+    }
+
+    #[test]
+    fn the_snapshot_generation_grows_with_each_cache_update() {
+        let server = ComputerUseLinux::default();
+        let first = server.snapshot_generation();
+        server.cache_nodes(&[node(1, None)]);
+        let second = server.snapshot_generation();
+        server.clear_cached_nodes();
+        let third = server.snapshot_generation();
+        assert!(first < second && second < third, "{first} {second} {third}");
+    }
+
+    #[test]
+    fn only_the_confirm_mode_reads_the_generation() {
+        let full = ComputerUseLinux::default();
+        assert!(full.gate_generation().is_none());
+        assert!(full.check_snapshot_generation(None).is_ok());
+        let mut config = crate::policy::PolicyConfig::from_lookup(|_| None);
+        config.mode = Mode::Confirm;
+        let confirm = ComputerUseLinux {
+            policy: Policy::new(config),
+            ..ComputerUseLinux::default()
+        };
+        let generation = confirm.gate_generation();
+        assert!(generation.is_some());
+        assert!(confirm.check_snapshot_generation(generation).is_ok());
+        confirm.cache_nodes(&[node(1, None)]);
+        let error = confirm.check_snapshot_generation(generation).unwrap_err();
+        assert!(error.contains("get_app_state"), "{error}");
+        assert!(error.contains("No input was sent"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn actions_refuse_when_the_snapshot_changed_after_the_gate() {
+        let server = ComputerUseLinux::default();
+        server.cache_nodes(&[node(1, bounds(0, 0, 10, 10))]);
+        let stale = Some(server.snapshot_generation());
+        // A new snapshot replaces the one that the gate rated.
+        server.cache_nodes(&[node(1, bounds(0, 0, 10, 10))]);
+
+        let click: ClickParams =
+            serde_json::from_value(serde_json::json!({"x": 5, "y": 5})).unwrap();
+        let result = server.dispatch_click(click, stale).await.0;
+        assert!(!result.ok);
+        assert!(
+            result.message.contains("get_app_state"),
+            "{}",
+            result.message
+        );
+
+        let value: SetValueParams =
+            serde_json::from_value(serde_json::json!({"element_index": 1, "value": "x"})).unwrap();
+        let result = server.dispatch_set_value(value, stale).await.0;
+        assert!(!result.ok);
+        assert!(
+            result.message.contains("get_app_state"),
+            "{}",
+            result.message
+        );
+
+        let action: ActionParams =
+            serde_json::from_value(serde_json::json!({"element_index": 1})).unwrap();
+        let result = server
+            .perform_element_action(&action, Some("click"), stale)
+            .await
+            .0;
+        assert!(!result.ok);
+        assert!(
+            result.message.contains("get_app_state"),
+            "{}",
+            result.message
+        );
+    }
+
+    #[tokio::test]
+    async fn actions_pass_the_snapshot_check_when_nothing_changed() {
+        let server = ComputerUseLinux::default();
+        server.cache_nodes(&[]);
+        let current = Some(server.snapshot_generation());
+        let action: ActionParams =
+            serde_json::from_value(serde_json::json!({"element_index": 9})).unwrap();
+        let result = server
+            .perform_element_action(&action, Some("click"), current)
+            .await
+            .0;
+        // The call goes past the check and fails on the missing element.
+        assert!(!result.ok);
+        assert!(
+            result.message.contains("element_index 9"),
+            "{}",
+            result.message
+        );
+        assert!(
+            !result.message.contains("changed after the safety check"),
+            "{}",
+            result.message
+        );
     }
 
     #[tokio::test]
@@ -8210,7 +8789,7 @@ printf '%s %s\n' "${0##*/}" "$*" >> "$CUL_POINTER_TEST_LOG"
             ..Default::default()
         };
         let results = [
-            backend.dispatch_click(click).await.0,
+            backend.dispatch_click(click, None).await.0,
             backend.dispatch_scroll(scroll).await.0,
             backend.dispatch_drag(drag).await.0,
         ];
@@ -11862,7 +12441,7 @@ mod post_action_capture_tests {
                 scroll[key] = value.clone();
             }
             let result = server
-                .dispatch_click(serde_json::from_value(click).unwrap())
+                .dispatch_click(serde_json::from_value(click).unwrap(), None)
                 .await
                 .0;
             assert!(!result.ok, "{}", result.message);
@@ -11882,7 +12461,7 @@ mod post_action_capture_tests {
         server.cache_desktop_size(1920, 1080);
         let click = serde_json::json!({"x": 1, "y": 2, "monitor": "NOPE-9"});
         let result = server
-            .dispatch_click(serde_json::from_value(click).unwrap())
+            .dispatch_click(serde_json::from_value(click).unwrap(), None)
             .await
             .0;
         assert!(!result.ok);
