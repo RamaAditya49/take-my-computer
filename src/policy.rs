@@ -320,6 +320,21 @@ fn ensure_dir(path: &Path) -> std::io::Result<()> {
     if meta.mode() & 0o077 != 0 {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
     }
+    // A symlink in the path as written must also belong to this user or to
+    // root. Otherwise its owner could point it at another directory later,
+    // and the kill switch check would read the wrong place.
+    for part in path.ancestors() {
+        if part.as_os_str().is_empty() {
+            continue;
+        }
+        let meta = std::fs::symlink_metadata(part)?;
+        if meta.file_type().is_symlink() && meta.uid() != uid && meta.uid() != 0 {
+            return Err(std::io::Error::new(
+                ErrorKind::PermissionDenied,
+                format!("{} is a symlink that another user owns", part.display()),
+            ));
+        }
+    }
     // Another user who owns a parent could swap the directory after this
     // check. Every parent must belong to this user or to root, and a parent
     // that others can write must have the sticky bit, as /tmp has.
@@ -3177,6 +3192,26 @@ mod tests {
         // The sticky bit makes a shared parent safe, as for /tmp.
         std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o1777)).unwrap();
         ensure_dir(&parent.join("take-my-computer")).unwrap();
+    }
+
+    #[test]
+    fn a_symlink_that_another_user_owns_is_refused_in_the_path() {
+        // Only root can give a symlink to another user, so the test needs root.
+        // SAFETY: getuid has no preconditions and cannot fail.
+        if unsafe { libc::getuid() } != 0 {
+            return;
+        }
+        let dir = TestDir::new("foreign-link");
+        let real = dir.0.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = dir.0.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        std::os::unix::fs::lchown(&link, Some(65534), Some(65534)).unwrap();
+        let error = ensure_dir(&link.join("take-my-computer")).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::PermissionDenied);
+        // The same symlink is fine when the user owns it.
+        std::os::unix::fs::lchown(&link, Some(0), Some(0)).unwrap();
+        ensure_dir(&link.join("take-my-computer")).unwrap();
     }
 
     #[test]
